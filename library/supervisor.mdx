@@ -1,0 +1,322 @@
+---
+title: "watchexec-supervisor: process lifecycle management"
+description: "The watchexec-supervisor crate manages Command creation, job spawning, lifecycle control, and process group handling for watchexec-powered tools."
+---
+
+The `watchexec-supervisor` crate is the process management layer of the watchexec ecosystem. It provides the `Command` type for describing how to run a program, and the `Job` handle for controlling that program's lifecycle — starting, stopping, restarting, signalling, and inspecting it — from async Rust code. The supervisor is intentionally not a single monolithic struct; instead, each `Job` independently manages one `Command` in a background Tokio task, and you hold a lightweight cloneable handle to it.
+
+## Adding to your project
+
+```toml
+[dependencies]
+watchexec-supervisor = "5"
+tokio = { version = "1", features = ["full"] }
+```
+
+## Describing a command
+
+### `Command`
+
+```rust
+pub struct Command {
+    /// The program to run.
+    pub program: Program,
+
+    /// Spawn options (grouping, session, signal mask).
+    pub options: SpawnOptions,
+}
+```
+
+### `Program`
+
+A `Program` is either a direct executable invocation or a shell command:
+
+```rust
+pub enum Program {
+    /// Run a specific binary with explicit arguments.
+    Exec {
+        prog: PathBuf,   // path or name of the binary
+        args: Vec<String>,
+    },
+
+    /// Run a string through a shell.
+    Shell {
+        shell: Shell,       // which shell to use
+        command: String,    // the command string to pass to the shell
+        args: Vec<String>,  // extra args appended to the shell invocation
+    },
+}
+```
+
+### `Shell`
+
+`Shell` describes how to invoke a shell. For most shells (bash, sh, zsh, fish, …) use `Shell::new`, which uses the `-c` convention. On Windows, `Shell::cmd()` uses `CMD.EXE /C`.
+
+```rust
+pub struct Shell {
+    pub prog: PathBuf,                       // shell binary path or name
+    pub options: Vec<String>,                // extra flags before `-c`
+    pub program_option: Option<Cow<'static, OsStr>>, // defaults to "-c"
+}
+
+impl Shell {
+    pub fn new(name: impl Into<PathBuf>) -> Self { ... }
+    pub fn cmd() -> Self { ... }  // Windows only
+}
+```
+
+### `SpawnOptions`
+
+```rust
+pub struct SpawnOptions {
+    /// Wrap the child in a process group (Unix) or Job Object (Windows).
+    pub grouped: bool,
+
+    /// Place the child in a new session (Unix only). Implies grouped.
+    pub session: bool,
+
+    /// Reset the signal mask before spawning (Unix only).
+    pub reset_sigmask: bool,
+}
+```
+
+<Note>
+Process grouping means that signals and termination are delivered to the entire group, not just the direct child. This is usually what you want for shell commands that spawn their own children.
+</Note>
+
+## Starting a job
+
+`start_job` takes an `Arc<Command>` and returns a `Job` handle plus a `JoinHandle` for the background task:
+
+```rust
+use std::sync::Arc;
+use watchexec_supervisor::command::{Command, Program};
+use watchexec_supervisor::job::start_job;
+
+let command = Arc::new(Command {
+    program: Program::Exec {
+        prog: "/usr/bin/my-server".into(),
+        args: vec!["--port".into(), "8080".into()],
+    },
+    options: Default::default(),
+});
+
+let (job, task) = start_job(command);
+```
+
+The background task runs immediately. The `JoinHandle` (`task`) lets you `.await` the task's completion after calling `job.delete_now()`.
+
+## The `Job` API
+
+`Job` is `Clone` (internally backed by `Arc`s). All methods queue a `Control` message and return a `Ticket`.
+
+### `Ticket`
+
+A `Ticket` is a future that resolves when the corresponding control has been processed by the job task. You can `.await` a ticket to synchronize, or drop it to fire-and-forget. Dropping a ticket does **not** cancel the control.
+
+### Lifecycle controls
+
+```rust
+// Start the command if not already running
+job.start().await;
+
+// Stop the command and wait for it to exit
+job.stop().await;
+
+// Send SIGTERM, wait 5 s, then SIGKILL
+job.stop_with_signal(Signal::Terminate, Duration::from_secs(5)).await;
+
+// Stop then start (always)
+job.restart().await;
+
+// Restart only if currently running
+job.try_restart().await;
+
+// Send a signal
+job.signal(Signal::User1).await;
+
+// Wait for the current process run to end
+job.to_wait().await;
+
+// Stop + mark for cleanup (waits for pending controls)
+job.delete().await;
+
+// Stop + cleanup immediately, bypassing the queue
+job.delete_now().await;
+```
+
+Controls are enqueued and processed in order. Because of ordering guarantees, you can chain calls without awaiting each one:
+
+```rust
+// These three controls will execute in order even though only
+// the last one is awaited:
+job.start();
+job.signal(Signal::User1);
+job.stop().await;
+```
+
+### Hooks and introspection
+
+`job.run(closure)` and `job.run_async(closure)` execute a function inside the job's task, giving it access to `JobTaskContext`:
+
+```rust
+job.run(|ctx| {
+    match ctx.current {
+        CommandState::Running { started, .. } => {
+            println!("running since {:?}", started);
+        }
+        CommandState::Finished { status, started, finished } => {
+            let duration = *finished - *started;
+            println!("finished with {status:?} after {duration:?}");
+        }
+        CommandState::Pending => {
+            println!("not started yet");
+        }
+    }
+}).await;
+```
+
+`JobTaskContext` has two fields:
+
+- `current: &CommandState` — the state of the currently executing (or just-finished) command.
+- `previous: Option<&CommandState>` — the state from the previous run, if any.
+
+### Spawn hooks
+
+A spawn hook runs once per process spawn, before the process starts. It receives a mutable `CommandWrap` handle and can apply additional process-wrap layers:
+
+```rust
+#[cfg(unix)]
+job.set_spawn_hook(|cmd, _ctx| {
+    use nix::sys::signal::{sigprocmask, SigSet, SigmaskHow, Signal};
+    unsafe {
+        cmd.command_mut().pre_exec(|| {
+            let mut mask = SigSet::empty();
+            mask.add(Signal::SIGINT);
+            sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)?;
+            Ok(())
+        });
+    }
+});
+```
+
+### Error handlers
+
+By default, I/O errors from spawning or waiting are silently ignored. Install an error handler to observe them:
+
+```rust
+job.set_error_handler(|err| {
+    eprintln!("supervisor error: {err}");
+});
+```
+
+## The `CommandState` enum
+
+`CommandState` represents the current lifecycle state of the process. It is exposed through `JobTaskContext` in hooks and `run` closures.
+
+```rust
+pub enum CommandState {
+    /// Not yet started, or reset between runs.
+    Pending,
+
+    /// The process is running.
+    Running {
+        child: Box<dyn ChildWrapper>,  // the live child handle
+        started: Instant,
+    },
+
+    /// The process has exited.
+    Finished {
+        status: ProcessEnd,   // how the process ended
+        started: Instant,     // when it was spawned
+        finished: Instant,    // when exit status was collected
+    },
+}
+```
+
+`ProcessEnd` is re-exported from `watchexec-events` and covers `Success`, `ExitError`, `ExitSignal`, `ExitStop`, `Exception`, and `Continued`.
+
+## Complete example
+
+<Steps>
+  <Step title="Build the command">
+
+```rust
+use std::sync::Arc;
+use watchexec_supervisor::command::{Command, Program, Shell, SpawnOptions};
+
+let command = Arc::new(Command {
+    program: Program::Shell {
+        shell: Shell::new("bash"),
+        command: "cargo build && ./target/debug/my-app".into(),
+        args: Vec::new(),
+    },
+    options: SpawnOptions {
+        grouped: true,  // signal the whole process group
+        ..Default::default()
+    },
+});
+```
+
+  </Step>
+  <Step title="Start the job">
+
+```rust
+use watchexec_supervisor::job::start_job;
+
+let (job, task) = start_job(command);
+job.start().await;
+```
+
+  </Step>
+  <Step title="React to events">
+
+```rust
+use watchexec_supervisor::Signal;
+use std::time::Duration;
+
+// On a file change, gracefully restart
+job.stop_with_signal(Signal::Terminate, Duration::from_secs(5));
+job.start().await;
+
+// On SIGINT, stop cleanly
+job.stop_with_signal(Signal::Terminate, Duration::from_secs(10)).await;
+```
+
+  </Step>
+  <Step title="Clean up">
+
+```rust
+job.delete_now().await;
+task.await; // wait for the background task to fully exit
+```
+
+  </Step>
+</Steps>
+
+## Using the supervisor with the watchexec library
+
+When building with the full `watchexec` crate, jobs are created through the action handler via `action.create_job(command)`, which registers them with the watchexec engine. The returned `Job` handle has the same API described above.
+
+```rust
+wx.config.on_action(|mut action| {
+    let (_, job) = action.create_job(Arc::new(Command {
+        program: Program::Exec {
+            prog: "make".into(),
+            args: vec!["test".into()],
+        },
+        options: Default::default(),
+    }));
+    job.start();
+    action
+});
+```
+
+<CardGroup cols={2}>
+  <Card title="watchexec-signals" icon="bolt" href="/library/signals">
+    `Signal` values used with `job.signal()` and `job.stop_with_signal()`.
+  </Card>
+  <Card title="watchexec-events" icon="tag" href="/library/events">
+    `ProcessEnd` used in `CommandState::Finished` to describe how a process exited.
+  </Card>
+</CardGroup>

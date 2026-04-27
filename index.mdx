@@ -1,133 +1,94 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "Watchexec: Execute commands when files change"
+description: "Watchexec watches files and directories for changes and automatically runs your commands. No runtime required — a single binary for Linux, macOS, and Windows."
 ---
 
-## Setting up
+Watchexec is a simple, standalone tool that monitors a path and runs a command whenever it detects file modifications. Whether you're running tests on code changes, rebuilding assets, or restarting a development server, watchexec stays out of your way and just works.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install watchexec via your package manager, cargo, or a pre-built binary.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get up and running with watchexec in under two minutes.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Command Reference" icon="terminal" href="/cli/watching">
+    Full reference for all watchexec flags and options.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Common Use Cases" icon="lightbulb" href="/guides/common-use-cases">
+    See real-world examples: test runners, build systems, dev servers.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What watchexec does
 
-Everything you need to create world-class documentation.
+When you run `watchexec make`, it immediately executes `make`, then watches the current directory. When any file changes, it runs `make` again. It coalesces rapid sequences of file events (like editor swap files) into a single run, loads your `.gitignore` and `.ignore` files automatically, and uses efficient kernel-level APIs so it doesn't burn CPU in a polling loop.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+<Steps>
+  <Step title="Install watchexec">
+    Install via your preferred method — package manager, Cargo, or a pre-built binary:
 
-## Make your content agent ready
+    ```bash
+    brew install watchexec          # macOS
+    cargo binstall watchexec-cli    # any platform with cargo
+    ```
+  </Step>
+  <Step title="Run your first watch">
+    Watch the current directory and run a command when anything changes:
 
-Make your docs work for humans and AI agents alike.
+    ```bash
+    watchexec make
+    ```
+  </Step>
+  <Step title="Filter to specific files">
+    Use `-e` to watch only certain file extensions, or `-f` / `-i` for glob patterns:
 
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
+    ```bash
+    watchexec -e rs,toml cargo test
+    watchexec -e js,css,html npm run build
+    ```
+  </Step>
+  <Step title="Restart long-running processes">
+    Use `-r` to kill and restart a server or daemon on each change:
 
-## Need inspiration?
+    ```bash
+    watchexec -r -e py -- python server.py
+    ```
+  </Step>
+</Steps>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Efficient file watching" icon="eye">
+    Uses inotify, FSEvents, and ReadDirectoryChangesW — no polling, minimal CPU overhead.
+  </Card>
+  <Card title="Smart ignore support" icon="filter">
+    Automatically reads `.gitignore`, `.ignore`, and other VCS ignore files.
+  </Card>
+  <Card title="Cross-platform" icon="globe">
+    A single static binary runs on Linux, macOS, Windows, and BSD — no runtime dependency.
+  </Card>
+  <Card title="Process control" icon="sliders">
+    Control busy-update behaviour: queue, restart, or send a signal to running processes.
+  </Card>
+  <Card title="Event emission" icon="satellite-dish">
+    Pass changed file paths to child processes via environment variables or JSON on stdin.
+  </Card>
+  <Card title="Rust library" icon="code">
+    Use the `watchexec` crate to build your own custom file-watching tools.
+  </Card>
+</CardGroup>
+
+## Rust library
+
+If you're building a tool that needs to respond to file changes, the [watchexec library](/library/overview) gives you the same engine as the CLI — event sources, filterers, process supervision, and a simple action handler API — without any of the CLI boilerplate.
+
+<CardGroup cols={2}>
+  <Card title="Library overview" icon="book" href="/library/overview">
+    Understand the watchexec library crate and when to use it.
+  </Card>
+  <Card title="Library quickstart" icon="rocket" href="/library/quickstart">
+    Add watchexec to your Rust project and handle your first file event.
+  </Card>
+</CardGroup>

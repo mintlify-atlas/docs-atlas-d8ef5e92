@@ -1,0 +1,293 @@
+---
+title: "Filtering file events in watchexec"
+description: "Reference for all watchexec filtering flags: --exts, --filter, --ignore, --fs-events, --filter-prog, and ignore-discovery control flags, with examples."
+---
+
+Watchexec applies filtering in a fixed pipeline order. Understanding this order is key to building effective filter combinations:
+
+1. **Internal prioritisation** — signals (especially SIGINT/SIGTERM) always pass through first.
+2. **Filesystem event kind** (`--fs-events`) — events for unwanted change types are dropped.
+3. **Explicitly watched paths** (`-w`) — events outside watched paths are dropped.
+4. **Ignores** (`--ignore`, `--ignore-file`, and automatically discovered ignore files) — matching paths are excluded.
+5. **Filters** (`--exts`, `--filter`, `--filter-file`) — only matching paths pass through.
+6. **Filter programs** (`--filter-prog`) — custom jaq expressions run last and short-circuit on first rejection.
+
+Non-file events (signals, keyboard events) skip path-based filtering entirely and always pass through.
+
+## Extension and pattern filters
+
+<ParamField path="-e / --exts" type="EXTENSIONS">
+  Filter to only emit events for files with the given extension(s).
+
+  Extensions can be given with or without the leading dot (`js` or `.js`). Multiple extensions can be provided by repeating the flag or by separating them with commas.
+
+  ```bash
+  # Watch only JavaScript files
+  watchexec -e js npm test
+
+  # Watch HTML, CSS, and JS files
+  watchexec -e html,css,js make
+
+  # Equivalent using repeated flags
+  watchexec -e html -e css -e js make
+  ```
+</ParamField>
+
+<ParamField path="-f / --filter" type="PATTERN">
+  Include only events for files matching a glob pattern. Can be repeated for multiple patterns.
+
+  Uses glob-like matching. Non-file events pass through untouched regardless of this filter.
+
+  ```bash
+  # Only trigger on changes to Rust source files
+  watchexec -f '**/*.rs' cargo test
+
+  # Only trigger on changes inside the src/ directory
+  watchexec -f 'src/**' make
+
+  # Multiple patterns
+  watchexec -f '*.go' -f '*.mod' go build ./...
+  ```
+</ParamField>
+
+<ParamField path="--filter-file" type="PATH">
+  Load filter patterns from a file, one pattern per line. Empty lines and lines starting with `#` are ignored. Uses the same glob syntax as `--filter`.
+
+  Can also be set via the `$WATCHEXEC_FILTER_FILES` environment variable. Multiple paths can be provided using the OS path separator (`:` on Unix, `;` on Windows).
+
+  ```bash
+  # Load filters from a file
+  watchexec --filter-file .watchexec-filters make
+
+  # Via environment variable
+  WATCHEXEC_FILTER_FILES=.watchexec-filters watchexec make
+  ```
+
+  Example filter file:
+
+  ```text
+  # Only watch source and config files
+  src/**
+  config/**/*.toml
+  *.go
+  ```
+</ParamField>
+
+## Ignore patterns
+
+<ParamField path="-i / --ignore" type="PATTERN">
+  Exclude events for files matching a glob pattern. Can be repeated for multiple patterns.
+
+  Non-file events pass through untouched regardless of this filter.
+
+  ```bash
+  # Ignore all generated files
+  watchexec -i '**/*.generated.js' npm test
+
+  # Ignore the dist/ directory
+  watchexec -i 'dist/**' make
+
+  # Ignore multiple patterns
+  watchexec -i '*.log' -i 'tmp/**' make
+  ```
+</ParamField>
+
+<ParamField path="--ignore-file" type="PATH">
+  Load ignore patterns from a file, one pattern per line. Empty lines and lines starting with `#` are ignored. Uses the same glob syntax as `--ignore`.
+
+  Can also be set via the `$WATCHEXEC_IGNORE_FILES` environment variable.
+
+  ```bash
+  watchexec --ignore-file .watchexec-ignore make
+  ```
+
+  Example ignore file:
+
+  ```text
+  # Build artefacts
+  dist/**
+  target/**
+  *.pyc
+  ```
+</ParamField>
+
+## Filesystem event type filtering
+
+<ParamField path="--fs-events" type="EVENTS" default="create,remove,rename,modify,metadata">
+  Filter to only emit events for specific types of filesystem change.
+
+  **Default:** all types except `access` (i.e. `create,remove,rename,modify,metadata`).
+
+  Available event types:
+
+  | Type | Description |
+  |---|---|
+  | `access` | File was read or opened |
+  | `create` | File or directory was created |
+  | `remove` | File or directory was deleted |
+  | `rename` | File or directory was renamed or moved |
+  | `modify` | File contents were changed |
+  | `metadata` | File metadata changed (permissions, timestamps, etc.) |
+
+  Multiple types can be combined with commas or by repeating the flag. When possible, watchexec applies this filter at the kernel level for efficiency.
+
+  ```bash
+  # Only react to file creation and deletion
+  watchexec --fs-events create,remove make
+
+  # Only react to content modifications
+  watchexec --fs-events modify npm test
+
+  # React to creates and renames only
+  watchexec --fs-events create --fs-events rename ./process-new-files.sh
+  ```
+</ParamField>
+
+<ParamField path="--no-meta" type="boolean">
+  Shorthand for `--fs-events create,remove,rename,modify`. Excludes metadata-only changes (permission changes, timestamp updates) from triggering events.
+
+  Cannot be combined with `--fs-events`.
+
+  ```bash
+  watchexec --no-meta make
+  ```
+</ParamField>
+
+## Programmatic filter expressions
+
+<ParamField path="-j / --filter-prog" type="EXPRESSION">
+  Provide a custom filter program written in [jaq](https://github.com/01mf02/jaq) (a jq-compatible query language). Programs receive events in the same JSON format as `--emit-events-to=json-stdio` and must return a boolean. A `true` result passes the event; `false` drops it.
+
+  Invalid programs cause watchexec to exit at startup. Use `-v` to see runtime errors from filter programs.
+
+  If the argument starts with `@`, the rest is interpreted as a path to a file containing the jaq program.
+
+  Filter programs run **after all other filters** and short-circuit: if any earlier filter rejects an event, the program is never called. Programs also stop after producing their first output value, so use `any` or `all` when iterating over arrays.
+
+  <Warning>
+    Filter programs—especially those accessing the filesystem or using the key-value store—are significantly slower than extension or glob filters. If events accumulate faster than programs can process them, watchexec will stall. Design programs to be as fast as possible and prefer the simpler filter flags when they are sufficient.
+  </Warning>
+
+  ### Custom built-in functions
+
+  In addition to the standard jaq library, watchexec provides:
+
+  <AccordionGroup>
+    <Accordion title="File metadata and content">
+      - `path | file_meta` — returns file metadata object, or `null` if the file does not exist.
+      - `path | file_size` — returns file size in bytes, or `null` if the file does not exist.
+      - `path | file_read(bytes)` — returns a string with the first `n` bytes of the file. Returns the whole file if smaller than `n`. There is no function to read an entire file at once, by design.
+      - `string | hash` / `path | file_hash` — returns an opaque hash of a string or file. The algorithm is not guaranteed; treat the result as opaque.
+    </Accordion>
+    <Accordion title="Key-value store">
+      - `any | kv_store(key)` — store a value under a key (in-memory only, no persistence).
+      - `kv_fetch(key)` — retrieve a value by key.
+      - `kv_clear` — clear all stored values.
+
+      Consistency is not guaranteed across concurrent filter executions.
+    </Accordion>
+    <Accordion title="Logging and output">
+      - `any | printout` — print a value to stdout and pass it through.
+      - `any | printerr` — print a value to stderr and pass it through.
+      - `any | log(level)` — log a value at the given level (`error`, `warn`, `info`, `debug`, `trace`) and pass it through.
+
+      Example: `[1] | log("debug") | .[]` produces `1` and logs `[1]`.
+    </Accordion>
+  </AccordionGroup>
+
+  ### Examples
+
+  <CodeGroup>
+
+  ```bash Regexp ignore filter on paths
+  watchexec -j 'all(.tags[] | select(.kind == "path"); .absolute | test("[.]test[.]js$")) | not' npm test
+  ```
+
+  ```bash Pass only file-create events
+  watchexec -j 'any(.tags[] | select(.kind == "fs"); .simple == "create")' ./handle-new-file.sh
+  ```
+
+  ```bash Pass events that touch executable files
+  watchexec -j 'any(.tags[] | select(.kind == "path" && .filetype == "file"); .absolute | file_meta | .executable)' ./run-executable.sh
+  ```
+
+  ```bash Ignore files that start with shebangs
+  watchexec -j 'any(.tags[] | select(.kind == "path" && .filetype == "file"); .absolute | file_read(2) == "#!") | not' make
+  ```
+
+  </CodeGroup>
+
+  Load a program from a file:
+
+  ```bash
+  watchexec -j @./my-filter.jaq make
+  ```
+</ParamField>
+
+## Disabling automatic ignore discovery
+
+Watchexec automatically discovers and loads several categories of ignore files. The flags below let you turn off each category independently.
+
+<ParamField path="--ignore-nothing" type="boolean">
+  Disable all automatic ignore discovery and all built-in default ignores. Shorthand for `--no-discover-ignore --no-default-ignore`.
+
+  Ignores explicitly provided via `--ignore` or `--ignore-file` on the command line are still applied.
+
+  ```bash
+  watchexec --ignore-nothing make
+  ```
+</ParamField>
+
+<ParamField path="--no-default-ignore" type="boolean">
+  Disable watchexec's built-in default ignore patterns.
+
+  By default, watchexec ignores common artefact and VCS paths including: editor swap files, `*.pyc`, `*.pyo`, `.DS_Store`, `.bzr`, `_darcs`, `.fossil-settings`, `.git`, `.hg`, `.pijul`, `.svn`, and watchexec's own log files.
+
+  ```bash
+  watchexec --no-default-ignore make
+  ```
+</ParamField>
+
+<ParamField path="--no-discover-ignore" type="boolean">
+  Skip all ignore file discovery. This is equivalent to `--no-global-ignore --no-vcs-ignore --no-project-ignore` but skips the discovery mechanism earlier and is therefore more efficient.
+
+  Built-in default ignores are still applied unless `--no-default-ignore` is also given.
+
+  ```bash
+  watchexec --no-discover-ignore make
+  ```
+</ParamField>
+
+<ParamField path="--no-global-ignore" type="boolean">
+  Do not load global or user-level ignore files.
+
+  Watchexec looks for global ignore files in locations such as `~/.gitignore`, `$XDG_CONFIG_HOME/git/ignore`, `~/.config/watchexec/ignore`, and Bazaar equivalents. This flag disables all of those.
+
+  ```bash
+  watchexec --no-global-ignore make
+  ```
+</ParamField>
+
+<ParamField path="--no-project-ignore" type="boolean">
+  Do not load project-local ignore files.
+
+  Disables loading of files such as `.gitignore`, `.hgignore`, `.bzrignore`, `_darcs/prefs/boring`, `.fossil-settings/ignore-glob`, and `.ignore` from inside the watched project tree.
+
+  VCS-specific ignore files are only loaded when the corresponding VCS is detected for the project. A `.bzrignore` found inside a Git repository is discarded.
+
+  ```bash
+  # Watch files that are gitignored
+  watchexec --no-project-ignore -e js make
+  ```
+</ParamField>
+
+<ParamField path="--no-vcs-ignore" type="boolean">
+  Do not load VCS ignore files (`.gitignore`, `.hgignore`, Bazaar, DARCS, Fossil excludes, etc.). Applies to both global and local VCS ignore files.
+
+  Useful when you need to watch files that are intentionally tracked by the VCS but normally filtered out, or when the VCS ignore file is too broad.
+
+  ```bash
+  # Watch build artefacts that are gitignored
+  watchexec --no-vcs-ignore -w dist ./deploy.sh
+  ```
+</ParamField>

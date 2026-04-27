@@ -1,0 +1,302 @@
+---
+title: "watchexec-events: event types and JSON format"
+description: "The watchexec-events crate defines Event, Tag, and related types used throughout the watchexec ecosystem, including the JSON event format."
+---
+
+The `watchexec-events` crate is the shared vocabulary of the watchexec ecosystem. It defines the `Event` and `Tag` types that every other crate uses to describe what happened — a file changed, a signal arrived, a subprocess exited. Keeping these types in their own crate lets tools that consume watchexec's output (via `--emit-events-to=json-stdio` or `--emit-events-to=json-file`) depend only on this small crate rather than on the full library.
+
+## Adding to your project
+
+```toml
+[dependencies]
+watchexec-events = "6"
+
+# Enable JSON serialization/deserialization:
+watchexec-events = { version = "6", features = ["serde"] }
+```
+
+<Note>
+The `notify` feature (on by default) re-exports Notify's `EventKind` types directly. Disable it with `default-features = false` for a leaner dependency tree when you only need to deserialize events, not produce them from a file watcher.
+</Note>
+
+## The `Event` struct
+
+An `Event` is the central type. It carries a list of `Tag` values — each tag is a piece of structured, filterable information about what triggered the event — plus an arbitrary metadata map for non-filterable context.
+
+```rust
+pub struct Event {
+    /// Structured information used for filtering and classification.
+    pub tags: Vec<Tag>,
+
+    /// Arbitrary key-value metadata. Not used for filtering.
+    pub metadata: HashMap<String, Vec<String>>,
+}
+```
+
+Helper methods let you extract information without manually iterating `tags`:
+
+```rust
+use watchexec_events::{Event, Tag};
+
+// Check if the event came from watchexec itself
+event.is_internal();
+
+// Iterate all paths mentioned in the event
+for (path, file_type) in event.paths() { ... }
+
+// Iterate all signals in the event
+for signal in event.signals() { ... }
+
+// Iterate all process completion statuses
+for end in event.completions() { ... }
+```
+
+## The `Tag` enum
+
+Every `Tag` variant describes one aspect of what happened. A single event can carry multiple tags — for example a filesystem event will typically have a `Path` tag and a `FileEventKind` tag together.
+
+```rust
+#[non_exhaustive]
+pub enum Tag {
+    Path { path: PathBuf, file_type: Option<FileType> },
+    FileEventKind(FileEventKind),
+    Source(Source),
+    Keyboard(Keyboard),
+    Process(u32),
+    Signal(Signal),
+    ProcessCompletion(Option<ProcessEnd>),
+    Unknown,  // only with the `serde` feature, for forward-compatibility
+}
+```
+
+### `Tag::Path`
+
+The event is about a specific file or directory.
+
+| Field | Type | Description |
+|---|---|---|
+| `path` | `PathBuf` | Absolute path to the file or directory |
+| `file_type` | `Option<FileType>` | `File`, `Dir`, `Symlink`, or `Other`, if known |
+
+### `Tag::FileEventKind`
+
+The kind of filesystem change, sourced from Notify's `EventKind`. In the JSON format this is represented as both a human-readable `simple` field and a detailed `full` string.
+
+Simple variants: `Access`, `Create`, `Modify`, `Remove`, `Other`.
+
+Full variants include sub-kinds like `Modify(Data(Content))`, `Modify(Name(Both))`, `Create(File)`, `Remove(Folder)`, and so on.
+
+### `Tag::Source`
+
+The general origin of the event.
+
+| Variant | Description |
+|---|---|
+| `Filesystem` | A file or directory change |
+| `Keyboard` | A keyboard input (e.g. EOF on stdin) |
+| `Mouse` | A mouse event |
+| `Os` | An OS-level event |
+| `Time` | A time-based trigger |
+| `Internal` | Generated internally by watchexec |
+
+### `Tag::Keyboard`
+
+A keyboard input event. The `Keyboard` enum has two variants:
+
+- `Eof` — end-of-file on stdin
+- `Key { key: KeyCode, modifiers: Modifiers }` — a key press in interactive mode
+
+`KeyCode` can be `Char(char)`, `Enter`, or `Escape`. `Modifiers` carries boolean `ctrl`, `alt`, and `shift` fields.
+
+### `Tag::Process`
+
+The PID (`u32`) of the process that caused the event.
+
+### `Tag::Signal`
+
+A signal delivered to the watchexec process itself. The inner type is `watchexec_signals::Signal`. Named variants serialize as their POSIX names (`"SIGHUP"`, `"SIGINT"`, etc.); custom signals serialize as integers.
+
+### `Tag::ProcessCompletion`
+
+The subprocess exited. The inner `Option<ProcessEnd>` is `None` when the disposition is unknown, or one of:
+
+| Variant | Serde `disposition` | Description |
+|---|---|---|
+| `Success` | `"success"` | Exit code 0 |
+| `ExitError(NonZeroI64)` | `"error"` | Non-zero exit code |
+| `ExitSignal(Signal)` | `"signal"` | Killed by a signal |
+| `ExitStop(NonZeroI32)` | `"stop"` | Stopped (Unix `WIFSTOPPED`) |
+| `Exception(NonZeroI32)` | `"exception"` | Unhandled exception (Windows) |
+| `Continued` | `"continued"` | Continued (Unix `WIFCONTINUED`) |
+
+## The `Priority` enum
+
+Events carry a priority that determines their position in the event queue. Higher-priority events are delivered first.
+
+| Variant | Use case |
+|---|---|
+| `Urgent` | Interrupt and Terminate signals — bypass filtering entirely |
+| `High` | Other signals to the main process |
+| `Normal` | Filesystem events (default) |
+| `Low` | Process completion events |
+
+## JSON event format
+
+When watchexec runs with `--emit-events-to=json-stdio`, each event is written as one JSON object per line. The format matches the `SerdeEvent` / `SerdeTag` structs.
+
+Each tag is a JSON object with a `kind` discriminant field. Additional fields depend on the kind.
+
+```json
+{"tags":[{"kind":"source","source":"filesystem"},{"kind":"path","absolute":"/home/user/project/src/main.rs","filetype":"file"},{"kind":"fs","simple":"modify","full":"Modify(Data(Content))"}],"metadata":{}}
+```
+
+<AccordionGroup>
+  <Accordion title="Path tag">
+
+```json
+{
+  "kind": "path",
+  "absolute": "/home/user/project/src/main.rs",
+  "filetype": "file"
+}
+```
+
+`filetype` is one of `"file"`, `"dir"`, `"symlink"`, `"other"`, or absent if unknown.
+
+  </Accordion>
+  <Accordion title="Fs (filesystem event kind) tag">
+
+```json
+{
+  "kind": "fs",
+  "simple": "modify",
+  "full": "Modify(Data(Content))"
+}
+```
+
+`simple` is one of `"access"`, `"create"`, `"modify"`, `"remove"`, `"other"`. `full` is the debug representation of Notify's `EventKind`.
+
+  </Accordion>
+  <Accordion title="Source tag">
+
+```json
+{
+  "kind": "source",
+  "source": "filesystem"
+}
+```
+
+  </Accordion>
+  <Accordion title="Signal tag">
+
+```json
+{
+  "kind": "signal",
+  "signal": "SIGTERM"
+}
+```
+
+Named signals use their POSIX name string. Custom signals use a raw integer.
+
+  </Accordion>
+  <Accordion title="Completion tag">
+
+```json
+{
+  "kind": "completion",
+  "disposition": "error",
+  "code": 1
+}
+```
+
+`disposition` is one of `"success"`, `"error"`, `"signal"`, `"stop"`, `"exception"`, `"continued"`, `"unknown"`. `code` and `signal` are present depending on the disposition.
+
+  </Accordion>
+  <Accordion title="Process tag">
+
+```json
+{
+  "kind": "process",
+  "pid": 12345
+}
+```
+
+  </Accordion>
+  <Accordion title="Keyboard tag">
+
+```json
+{
+  "kind": "keyboard",
+  "keycode": "eof"
+}
+```
+
+  </Accordion>
+</AccordionGroup>
+
+## Consuming events from a subprocess
+
+The primary external use case is reading events emitted by watchexec to a child process or to a log file. With the `serde` feature and `serde_json`, each newline-delimited JSON record deserializes directly into `Event`.
+
+```rust
+use std::io::{stdin, BufRead};
+use watchexec_events::{Event, Tag};
+
+fn main() -> std::io::Result<()> {
+    for line in stdin().lock().lines() {
+        let event: Event = serde_json::from_str(&line?).unwrap();
+
+        for (path, _file_type) in event.paths() {
+            println!("changed: {}", path.display());
+        }
+
+        for signal in event.signals() {
+            println!("signal: {signal}");
+        }
+
+        for completion in event.completions() {
+            println!("process ended: {completion:?}");
+        }
+    }
+
+    Ok(())
+}
+```
+
+## Matching on tags in an action handler
+
+When using the `watchexec` library directly, events arrive in the action handler. Match on tags to decide what to do.
+
+```rust
+use watchexec_events::{Event, Tag, Source};
+use watchexec_signals::Signal;
+
+fn handle(event: &Event) {
+    for tag in &event.tags {
+        match tag {
+            Tag::Path { path, file_type } => {
+                println!("file changed: {} ({file_type:?})", path.display());
+            }
+            Tag::Signal(Signal::Interrupt) => {
+                println!("received SIGINT, quitting");
+            }
+            Tag::ProcessCompletion(Some(end)) => {
+                println!("process ended: {end:?}");
+            }
+            Tag::Source(Source::Internal) => {
+                // internal event — often safe to ignore
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="watchexec-signals" icon="bolt" href="/library/signals">
+    The `Signal` type used inside `Tag::Signal` and `ProcessEnd::ExitSignal`.
+  </Card>
+  <Card title="Action handler" icon="code" href="/library/action-handler">
+    How to handle events in the `on_action` callback of the watchexec library.
+  </Card>
+</CardGroup>

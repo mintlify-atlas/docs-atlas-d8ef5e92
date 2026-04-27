@@ -1,0 +1,341 @@
+---
+title: "Get started with the watchexec Rust library"
+description: "Add the watchexec crate to your Rust project, set up an action handler, watch a directory, and manage processes with this step-by-step guide."
+---
+
+This guide walks you through embedding the `watchexec` library in a Rust project. You will add the required dependencies, write a minimal action handler that reacts to file changes and signals, and then extend it with supervised job management. Each step builds on the previous one, so you can stop wherever your use case is satisfied.
+
+<Tip>
+The library uses [miette](https://docs.rs/miette) for rich, human-friendly error messages. All error types also implement `std::error::Error`, so you can use any error-handling library you prefer — but `miette` with the `fancy` feature gives you source-context diagnostics for free.
+</Tip>
+
+<Steps>
+  <Step title="Add dependencies to Cargo.toml">
+    Add `watchexec` and its signal types to your `Cargo.toml`. The library requires Tokio and works best with `miette` for error handling.
+
+    ```toml
+    [dependencies]
+    watchexec = "8.2.0"
+    watchexec-signals = "5.0.1"
+    tokio = { version = "1", features = ["full"] }
+    miette = { version = "7.2.0", features = ["fancy"] }
+    ```
+
+    If you want to send synthetic events (useful for triggering an initial run without a file change), also add `watchexec-events`:
+
+    ```toml
+    watchexec-events = "6.1.0"
+    ```
+
+    <Note>
+    The library generates a large volume of internal tracing messages — including at the `error` level. Do **not** enable printing of `error`-level logs for the `watchexec` crate in production. Use `Config::on_error()` to handle runtime errors that are meant for you, and configure `tracing-subscriber` with an env filter (e.g. `RUST_LOG=warn`) to suppress internal noise.
+    </Note>
+  </Step>
+
+  <Step title="Write a minimal watcher">
+    The smallest useful program: watch the current directory, print every event, and quit cleanly on Ctrl-C (SIGINT).
+
+    ```rust
+    use miette::{IntoDiagnostic, Result};
+    use watchexec::Watchexec;
+    use watchexec_signals::Signal;
+
+    #[tokio::main]
+    async fn main() -> Result<()> {
+        let wx = Watchexec::new(|mut action| {
+            // print every incoming event
+            for event in action.events.iter() {
+                eprintln!("EVENT: {event:?}");
+            }
+
+            // quit cleanly when Ctrl-C is received
+            if action.signals().any(|sig| sig == Signal::Interrupt) {
+                action.quit();
+            }
+
+            action
+        })?;
+
+        // watch the current directory
+        wx.config.pathset(["."]);
+
+        wx.main().await.into_diagnostic()?;
+        Ok(())
+    }
+    ```
+
+    Key points:
+
+    - `Watchexec::new(handler)` accepts a synchronous closure. Use `Watchexec::new_async` if your handler needs to `await`.
+    - `action.signals()` returns an iterator over `Signal` values collected in this batch of events.
+    - `action.quit()` schedules a graceful shutdown. Call `action.quit_gracefully(signal, timeout)` when you want to forward a signal to running jobs before exiting.
+    - The handler **must return the `action` value**. This is how Watchexec receives your decisions.
+    - `wx.config.pathset(…)` can be called before or after `wx.main()` — configuration is live.
+  </Step>
+
+  <Step title="Add job management">
+    Watchexec can supervise child processes directly. Jobs are created inside the action handler and managed through a `Job` handle.
+
+    ```rust
+    use miette::{IntoDiagnostic, Result};
+    use std::sync::Arc;
+    use watchexec::{
+        command::{Command, Program},
+        Watchexec,
+    };
+    use watchexec_signals::Signal;
+
+    #[tokio::main]
+    async fn main() -> Result<()> {
+        let wx = Watchexec::new(|mut action| {
+            // quit on Ctrl-C
+            if action.signals().any(|sig| sig == Signal::Interrupt) {
+                action.quit();
+                return action;
+            }
+
+            // restart the job when file events arrive
+            if action.paths().next().is_some() {
+                if let Some((_, job)) = action.list_jobs().next() {
+                    let job = job.clone();
+                    job.restart();
+                }
+            }
+
+            // create the job on first run (get_or_create_job is idempotent)
+            let (_, job) = action.create_job(Arc::new(Command {
+                program: Program::Exec {
+                    prog: "cargo".into(),
+                    args: vec!["run".into()],
+                },
+                options: Default::default(),
+            }));
+
+            job.start();
+            action
+        })?;
+
+        wx.config.pathset(["src"]);
+        wx.main().await.into_diagnostic()?;
+        Ok(())
+    }
+    ```
+
+    Use `action.get_or_create_job(id, command_fn)` with a stable `Id` to avoid creating duplicate jobs across handler invocations. `Id::default()` generates a unique ID; store it outside the handler (e.g. in a `move` closure) to reuse it.
+  </Step>
+
+  <Step title="Full example: supervised bash process with auto-restart">
+    This example from the README shows the full range of library features: job creation, spawn hooks, auto-restart on exit, graceful stop on file change, and signal-based quit.
+
+    ```rust
+    use miette::{IntoDiagnostic, Result};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use watchexec::{
+        command::{Command, Program, Shell},
+        job::CommandState,
+        Watchexec,
+    };
+    use watchexec_events::{Event, Priority};
+    use watchexec_signals::Signal;
+
+    #[tokio::main]
+    async fn main() -> Result<()> {
+        // configure tracing — watchexec logs a LOT; use an env filter
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .init();
+
+        // initialise Watchexec with an action handler that creates the job
+        let job = Arc::new(Mutex::new(None));
+        let wx = Watchexec::new({
+            let outerjob = job.clone();
+            move |mut action| {
+                let (_, job) = action.create_job(Arc::new(Command {
+                    program: Program::Shell {
+                        shell: Shell::new("bash"),
+                        command: "
+                            echo 'Hello world'
+                            trap 'echo Not quitting yet!' TERM
+                            read
+                        "
+                        .into(),
+                        args: Vec::new(),
+                    },
+                    options: Default::default(),
+                }));
+
+                // store the job handle outside this closure
+                *outerjob.lock().unwrap() = Some(job.clone());
+
+                // block SIGINT in the child process (Unix only)
+                #[cfg(unix)]
+                job.set_spawn_hook(|cmd, _| {
+                    use nix::sys::signal::{sigprocmask, SigSet, SigmaskHow, Signal};
+                    unsafe {
+                        cmd.command_mut().pre_exec(|| {
+                            let mut newset = SigSet::empty();
+                            newset.add(Signal::SIGINT);
+                            sigprocmask(SigmaskHow::SIG_BLOCK, Some(&newset), None)?;
+                            Ok(())
+                        });
+                    }
+                });
+
+                job.start();
+                action
+            }
+        })?;
+
+        let main = wx.main();
+
+        // send a synthetic event to trigger the first run immediately
+        wx.send_event(Event::default(), Priority::Urgent)
+            .await
+            .unwrap();
+
+        // spin until the job handle is available
+        while job.lock().unwrap().is_none() {
+            tokio::task::yield_now().await;
+        }
+
+        // auto-restart the job whenever it exits
+        let job = job.lock().unwrap().clone().unwrap();
+        let auto_restart = tokio::spawn(async move {
+            loop {
+                job.to_wait().await;
+                job.run(|context| {
+                    if let CommandState::Finished {
+                        status,
+                        started,
+                        finished,
+                    } = context.current
+                    {
+                        let duration = *finished - *started;
+                        eprintln!("[Program stopped with {status:?}; ran for {duration:?}]");
+                    }
+                })
+                .await;
+
+                eprintln!("[Restarting...]");
+                job.start().await;
+            }
+        });
+
+        // replace the action handler: quit on Ctrl-C, gracefully stop on file events
+        let auto_restart_abort = auto_restart.abort_handle();
+        wx.config.on_action(move |mut action| {
+            if action.signals().any(|sig| sig == Signal::Interrupt) {
+                eprintln!("[Quitting...]");
+                auto_restart_abort.abort();
+                action.quit_gracefully(Signal::ForceStop, Duration::ZERO);
+                return action;
+            }
+
+            if action.paths().next().is_some() {
+                if let Some(job) = action.list_jobs().next().map(|(_, job)| job.clone()) {
+                    eprintln!("[Asking program to stop...]");
+                    job.stop_with_signal(Signal::Terminate, Duration::from_secs(5));
+                }
+            }
+
+            action
+        });
+
+        // watch the current directory
+        wx.config.pathset(["."]);
+
+        let _ = main.await.into_diagnostic()?;
+        auto_restart.abort();
+        Ok(())
+    }
+    ```
+
+    Notable patterns in this example:
+
+    - **Synthetic events**: `wx.send_event(Event::default(), Priority::Urgent)` triggers the action handler without waiting for a real file change — useful to start a job immediately on launch.
+    - **Live handler replacement**: `wx.config.on_action(…)` replaces the action handler at runtime. The new handler takes effect on the next event batch.
+    - **`quit_gracefully`**: sends a signal to all running jobs and waits up to the given timeout before forcing exit.
+    - **`job.to_wait().await`**: suspends the spawned task until the job process exits, enabling clean restart loops.
+  </Step>
+</Steps>
+
+## Additional examples
+
+The repository ships three more focused examples you can run with `cargo run --example <name>`:
+
+**`only_events.rs`** — watch a directory and print events without spawning any processes. Useful as a starting point when you only need observation.
+
+```rust
+// only_events.rs (abridged)
+let wx = Watchexec::new(|mut action| {
+    for event in action.events.iter() {
+        eprintln!("{event:?}");
+    }
+    if action.signals().next().is_some() {
+        action.quit();
+    }
+    action
+})?;
+wx.config.pathset(["."]);
+wx.main().await.into_diagnostic()?;
+```
+
+**`only_commands.rs`** — run a command on a timer without watching any files. Demonstrates that file watching is optional; you can drive the action handler entirely from synthetic events.
+
+```rust
+// only_commands.rs (abridged)
+// sends a synthetic event every 5 seconds via a spawned task
+tokio::spawn(async move {
+    loop {
+        sleep(Duration::from_secs(5)).await;
+        wx.send_event(Event::default(), Priority::Urgent).await.unwrap();
+    }
+});
+```
+
+**`restart_run_on_successful_build.rs`** — run `cargo build`, wait for it to finish, and only restart `cargo run` when the build succeeds. Shows `get_or_create_job` with stable IDs, `job.to_wait().await`, and conditional restart based on `CommandState::Finished { status: ProcessEnd::Success, .. }`.
+
+```rust
+// restart_run_on_successful_build.rs (abridged)
+let build_id = Id::default();
+let run_id = Id::default();
+let wx = Watchexec::new_async(move |mut action| {
+    Box::new(async move {
+        let build = action.get_or_create_job(build_id, || Arc::new(/* cargo build */));
+        let run   = action.get_or_create_job(run_id,   || Arc::new(/* cargo run  */));
+
+        if action.paths().next().is_some() {
+            build.restart().await;
+        }
+
+        build.to_wait().await;
+        build.run(move |context| {
+            if let CommandState::Finished { status: ProcessEnd::Success, .. } = context.current {
+                run.restart();
+            }
+        }).await;
+
+        action
+    })
+})?;
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Watchexec struct" icon="circle-play" href="/library/watchexec">
+    Full reference for `Watchexec::new`, `new_async`, `main`, `send_event`, and `clone`.
+  </Card>
+  <Card title="Config reference" icon="sliders" href="/library/config">
+    All config fields, live reconfiguration, and the `fs_ready` notification channel.
+  </Card>
+  <Card title="Action handler" icon="code" href="/library/action-handler">
+    Everything available inside the action handler: events, jobs, signals, quit modes.
+  </Card>
+  <Card title="Filterers" icon="filter" href="/library/filterers">
+    Add glob or ignore-file filtering, or implement the `Filterer` trait yourself.
+  </Card>
+</CardGroup>

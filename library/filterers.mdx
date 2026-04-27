@@ -1,0 +1,248 @@
+---
+title: "Filtering events with watchexec filterers"
+description: "Implement the Filterer trait or use the built-in globset and ignore filterers to control which file events reach your action handler."
+---
+
+Filterers sit between the raw event stream and your action handler. Every event produced by a filesystem watcher, signal source, or keyboard source passes through the active filterer before it can trigger an action. By default the filterer is a no-op that passes everything; swap it out to limit which paths and event types your handler sees.
+
+## The `Filterer` trait
+
+```rust
+pub trait Filterer: std::fmt::Debug + Send + Sync {
+    fn check_event(
+        &self,
+        event: &Event,
+        priority: Priority,
+    ) -> Result<bool, RuntimeError>;
+}
+```
+
+Any type that implements `Filterer` can be plugged into watchexec. The contract is simple:
+
+- Return `Ok(true)` → the event passes and may trigger an action.
+- Return `Ok(false)` → the event is discarded silently.
+- Return `Err(e)` → the event is discarded and the error is sent to the `on_error` handler.
+
+`check_event` is called on the hot path for every event. It must be **synchronous and fast** — do any expensive setup (file I/O, compiling patterns) once at construction time.
+
+<Note>
+Empty events and `Priority::Urgent` events bypass the filterer entirely and always reach the action handler.
+</Note>
+
+The unit type `()` implements `Filterer` as a pass-through — it is the default filterer.
+
+### Implementing a custom filterer
+
+```rust
+use watchexec::{error::RuntimeError, filter::Filterer};
+use watchexec_events::{Event, Priority};
+
+#[derive(Debug)]
+struct RustFilesOnly;
+
+impl Filterer for RustFilesOnly {
+    fn check_event(
+        &self,
+        event: &Event,
+        _priority: Priority,
+    ) -> Result<bool, RuntimeError> {
+        // pass non-path events unchanged
+        let mut has_paths = false;
+        for (path, _) in event.paths() {
+            has_paths = true;
+            if path.extension().map_or(false, |e| e == "rs") {
+                return Ok(true);
+            }
+        }
+        // pass events with no paths (signals, keyboard, etc.)
+        Ok(!has_paths)
+    }
+}
+```
+
+## Setting a filterer
+
+Pass any `Filterer` implementation to `Config::filterer`:
+
+```rust
+wx.config.filterer(RustFilesOnly);
+```
+
+This replaces the active filterer immediately — the next event to arrive will be checked against the new filterer. You can swap filterers at any time, including from inside the action handler.
+
+## Built-in filterers
+
+### `watchexec-filterer-globset` — the default CLI filterer
+
+`GlobsetFilterer` is the filterer used by the watchexec CLI. It layers three matching mechanisms on top of an `IgnoreFilterer`:
+
+1. **Ignore list** — glob patterns for paths that should always be rejected.
+2. **Filter list** — glob patterns for paths that should be accepted (if non-empty, only matching paths pass).
+3. **Extension list** — a list of file extensions; only files with these extensions pass.
+4. **Whitelist** — absolute paths that are always accepted regardless of other rules.
+
+Non-path events (signals, keyboard) always pass.
+
+Add to `Cargo.toml`:
+
+```toml
+[dependencies]
+watchexec-filterer-globset = "8"
+```
+
+#### Constructor
+
+```rust
+pub async fn GlobsetFilterer::new(
+    origin: impl AsRef<Path>,
+    filters: impl IntoIterator<Item = (String, Option<PathBuf>)>,
+    ignores: impl IntoIterator<Item = (String, Option<PathBuf>)>,
+    whitelist: impl IntoIterator<Item = PathBuf>,
+    ignore_files: impl IntoIterator<Item = IgnoreFile>,
+    extensions: impl IntoIterator<Item = OsString>,
+) -> Result<Self, Error>
+```
+
+Each glob pattern is passed as `(pattern_string, optional_scope_directory)`. A `None` scope means the pattern is global; a `Some(path)` scope means it only applies to files under that directory (mirroring how `.gitignore` files work).
+
+```rust
+use std::{ffi::OsString, path::PathBuf};
+use watchexec_filterer_globset::GlobsetFilterer;
+
+let filterer = GlobsetFilterer::new(
+    // project root
+    "/home/user/myproject",
+    // include only *.rs and *.toml files
+    [
+        ("*.rs".to_string(), None),
+        ("*.toml".to_string(), None),
+    ],
+    // ignore target/ and .git/
+    [
+        ("target/**".to_string(), None),
+        (".git/**".to_string(), None),
+    ],
+    // no extra whitelist entries
+    [],
+    // no explicit ignore files (GlobsetFilterer finds them automatically)
+    [],
+    // alternatively, filter by extension
+    [],
+)
+.await?;
+
+wx.config.filterer(filterer);
+```
+
+<Tip>
+Filter patterns and ignore patterns both use gitignore-style glob syntax via the `ignore` crate. A non-empty filter list means "only these paths pass"; an empty filter list means all paths pass (unless matched by an ignore pattern).
+</Tip>
+
+### `watchexec-filterer-ignore` — ignore-file semantics
+
+`IgnoreFilterer` wraps the `ignore_files::IgnoreFilter` type and applies the rules from `.gitignore`, `.ignore`, `.watchexecignore`, and similar files. It is intended to be used as a sub-filterer inside a larger filterer, rather than standalone.
+
+Add to `Cargo.toml`:
+
+```toml
+[dependencies]
+watchexec-filterer-ignore = "7"
+```
+
+#### Type definition
+
+```rust
+#[derive(Clone, Debug)]
+pub struct IgnoreFilterer(pub IgnoreFilter);
+```
+
+The inner `IgnoreFilter` from the `ignore_files` crate holds the compiled ignore rules. Build it with `ignore_files::IgnoreFilter::new`, then wrap it:
+
+```rust
+use ignore_files::{IgnoreFile, IgnoreFilter};
+use watchexec_filterer_ignore::IgnoreFilterer;
+
+// discover ignore files for the project
+let origin = std::path::Path::new(".");
+let files: Vec<IgnoreFile> = ignore_files::from_origin(origin).await?.0;
+
+let mut filter = IgnoreFilter::new(origin, &files).await?;
+filter.finish();
+
+let filterer = IgnoreFilterer(filter);
+wx.config.filterer(filterer);
+```
+
+#### Behaviour
+
+- Returns `Ok(false)` for any path matched by an ignore rule in scope.
+- Returns `Ok(true)` for paths matched by a whitelist (negation) rule.
+- Returns `Ok(true)` for everything else, including non-path events.
+- Never returns an error.
+
+## `ChangeableFilterer` — runtime-swappable wrapper
+
+```rust
+pub struct ChangeableFilterer(Changeable<Arc<dyn Filterer>>);
+```
+
+`ChangeableFilterer` is the type of the `Config::filterer` field. It implements `Filterer` itself, delegating to whichever concrete filterer is currently installed, without holding a lock during the check.
+
+When you call `wx.config.filterer(my_filterer)`, the library calls `ChangeableFilterer::replace` internally:
+
+```rust
+pub fn replace(&self, new: impl Filterer + 'static)
+```
+
+You can also use `ChangeableFilterer` directly in your own code when you need a shared, swappable filterer that multiple parts of your program can replace:
+
+```rust
+use std::sync::Arc;
+use watchexec::filter::ChangeableFilterer;
+
+let cf = Arc::new(ChangeableFilterer::default()); // starts with no-op ()
+// give it to config
+wx.config.filterer(Arc::clone(&cf));
+
+// later, swap the filterer from any thread
+cf.replace(RustFilesOnly);
+```
+
+## Combining filterers
+
+Because `Filterer` is a trait, you can compose multiple filterers into one:
+
+```rust
+use watchexec::{error::RuntimeError, filter::Filterer};
+use watchexec_events::{Event, Priority};
+
+#[derive(Debug)]
+struct And<A, B>(A, B);
+
+impl<A: Filterer, B: Filterer> Filterer for And<A, B> {
+    fn check_event(
+        &self,
+        event: &Event,
+        priority: Priority,
+    ) -> Result<bool, RuntimeError> {
+        Ok(self.0.check_event(event, priority)?
+            && self.1.check_event(event, priority)?)
+    }
+}
+
+// use the ignore filterer AND a custom extension filter
+let combined = And(ignore_filterer, RustFilesOnly);
+wx.config.filterer(combined);
+```
+
+<CardGroup cols={2}>
+  <Card title="Watchexec struct" href="/library/watchexec">
+    Constructors and lifecycle
+  </Card>
+  <Card title="Config reference" href="/library/config">
+    config.filterer() and other settings
+  </Card>
+  <Card title="Action handler" href="/library/action-handler">
+    What happens after events pass the filterer
+  </Card>
+</CardGroup>

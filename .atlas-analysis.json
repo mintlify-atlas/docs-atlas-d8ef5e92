@@ -1,0 +1,116 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "Watchexec",
+  "projectDescription": "A simple, standalone command-line tool that watches files and directories for changes and executes commands in response, with a companion Rust library for building custom file-watching tools.",
+  "theme": "aspen",
+  "primaryColor": "#7c7c7c",
+  "lightColor": "#0f0f0f",
+  "darkColor": "#b9b9b9",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "CLI",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Command Reference",
+            "pages": [
+              "cli/watching",
+              "cli/filtering",
+              "cli/command-execution",
+              "cli/output-and-debugging"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/common-use-cases",
+              "guides/ignore-files",
+              "guides/event-emission",
+              "guides/signal-handling",
+              "guides/shell-completions"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Library",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "library/overview",
+              "library/quickstart"
+            ]
+          },
+          {
+            "group": "Core API",
+            "pages": [
+              "library/watchexec",
+              "library/config",
+              "library/action-handler",
+              "library/filterers"
+            ]
+          },
+          {
+            "group": "Supporting Crates",
+            "pages": [
+              "library/events",
+              "library/signals",
+              "library/supervisor",
+              "library/ignore-files",
+              "library/project-origins"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Watches files and directories for changes using efficient kernel-level mechanisms (inotify, FSEvents, ReadDirectoryChangesW)",
+    "Automatically runs commands on file changes with debouncing to coalesce multiple events",
+    "Supports glob pattern filtering and ignore files (.gitignore, .ignore, etc.)",
+    "Cross-platform: Linux, macOS, Windows, BSD",
+    "Restarts long-running processes (servers, daemons) with configurable signals",
+    "Emits structured event data (JSON or env vars) to child processes",
+    "Interactive mode with keypress controls (restart, pause, quit)",
+    "Desktop notifications on command start/end",
+    "Rust library crate for building custom file-watching tools",
+    "No language runtime dependency — single static binary"
+  ],
+  "publicApiSurface": [
+    "watchexec [OPTIONS] [COMMAND]",
+    "--watch / -w <PATH>",
+    "--exts / -e <EXTENSIONS>",
+    "--filter / -f <PATTERN>",
+    "--ignore / -i <PATTERN>",
+    "--restart / -r",
+    "--on-busy-update / -o <MODE>",
+    "--signal / -s <SIGNAL>",
+    "--debounce / -d <TIMEOUT>",
+    "--emit-events-to <MODE>",
+    "--fs-events <EVENTS>",
+    "--shell <SHELL>",
+    "--clear / -c",
+    "--notify / -N",
+    "--interactive / -I",
+    "--postpone / -p",
+    "--filter-prog / -j <EXPRESSION>",
+    "--poll [<INTERVAL>]",
+    "--timings",
+    "--wrap-process <MODE>",
+    "Watchexec::new(action_handler) [Rust lib]",
+    "Config::pathset() [Rust lib]",
+    "Config::on_action() [Rust lib]",
+    "Config::filterer() [Rust lib]",
+    "ActionHandler::create_job() [Rust lib]",
+    "ActionHandler::quit() / quit_gracefully() [Rust lib]"
+  ]
+}

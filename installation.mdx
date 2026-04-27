@@ -1,0 +1,205 @@
+---
+title: "Installing watchexec on Linux, macOS, and Windows"
+description: "All installation methods for watchexec — package managers, cargo binstall, pre-built binaries (deb, rpm, tarball, zip), and building from source."
+---
+
+Watchexec ships as a single static binary with no runtime dependency. Pick the installation method that fits your platform and workflow.
+
+<Tabs>
+  <Tab title="Linux">
+    **Alpine**
+
+    ```bash
+    apk add watchexec
+    ```
+
+    **Arch Linux / Manjaro**
+
+    ```bash
+    pacman -S watchexec
+    ```
+
+    **Nix**
+
+    ```bash
+    nix-shell -p watchexec
+    ```
+
+    **openSUSE**
+
+    ```bash
+    zypper install watchexec
+    ```
+
+    **Void Linux**
+
+    ```bash
+    xbps-install watchexec
+    ```
+
+    **Termux (Android)**
+
+    ```bash
+    pkg install watchexec
+    ```
+
+    **Gentoo (GURU overlay)**
+
+    ```bash
+    emerge -av watchexec
+    ```
+
+    For a full list of Linux packages, see the [known packages list](https://github.com/watchexec/watchexec/blob/main/doc/packages.md).
+  </Tab>
+  <Tab title="macOS">
+    **Homebrew**
+
+    ```bash
+    brew install watchexec
+    ```
+
+    **MacPorts**
+
+    ```bash
+    port install watchexec
+    ```
+
+    **Nix**
+
+    ```bash
+    nix-shell -p watchexec
+    ```
+  </Tab>
+  <Tab title="Windows">
+    **Scoop**
+
+    ```powershell
+    scoop install watchexec
+    ```
+
+    **Chocolatey**
+
+    ```powershell
+    choco install watchexec
+    ```
+
+    **MSYS2 (mingw)**
+
+    ```bash
+    pacman -S mingw-w64-x86_64-watchexec
+    ```
+  </Tab>
+  <Tab title="Any platform">
+    **cargo binstall** (downloads a pre-built binary via Cargo)
+
+    ```bash
+    cargo binstall watchexec-cli
+    ```
+
+    This requires [cargo-binstall](https://github.com/cargo-bins/cargo-binstall). It fetches the correct pre-built binary for your platform from the GitHub release — faster than compiling from source.
+
+    **Build from source**
+
+    ```bash
+    cargo install --locked watchexec-cli
+    ```
+
+    Only the latest stable Rust toolchain is officially supported, though older versions may work.
+  </Tab>
+</Tabs>
+
+## Pre-built binaries
+
+If your package manager doesn't carry watchexec, you can install a pre-built binary directly from GitHub releases.
+
+<Steps>
+  <Step title="Download the archive">
+    Go to the [latest release on GitHub](https://github.com/watchexec/watchexec/releases/latest) and download the archive for your platform and architecture:
+
+    | Platform | Format | Example filename |
+    |---|---|---|
+    | Linux | `.tar.xz` | `watchexec-2.5.1-x86_64-unknown-linux-musl.tar.xz` |
+    | Linux | `.deb` | `watchexec-2.5.1-x86_64-unknown-linux-musl.deb` |
+    | Linux | `.rpm` | `watchexec-2.5.1-x86_64-unknown-linux-gnu.rpm` |
+    | macOS | `.tar.xz` | `watchexec-2.5.1-aarch64-apple-darwin.tar.xz` |
+    | Windows | `.zip` | `watchexec-2.5.1-x86_64-pc-windows-msvc.zip` |
+
+    Checksums and signatures are published alongside each release.
+  </Step>
+  <Step title="Extract the archive">
+    <CodeGroup>
+      ```bash Linux / macOS
+      tar xf watchexec-*.tar.xz
+      ```
+
+      ```powershell Windows
+      Expand-Archive -Path watchexec-*.zip -DestinationPath .
+      ```
+    </CodeGroup>
+
+    For `.deb` and `.rpm` packages, use your system package manager to install them directly:
+
+    ```bash
+    # Debian / Ubuntu
+    dpkg -i watchexec-*.deb
+
+    # Fedora / RHEL / openSUSE
+    dnf install watchexec-*.rpm
+    ```
+  </Step>
+  <Step title="Place the binary in your PATH">
+    Move the `watchexec` binary to a directory in your `PATH`, for example:
+
+    ```bash
+    mv watchexec /usr/local/bin/
+    ```
+
+    On Windows, copy `watchexec.exe` to a directory listed in your `PATH` environment variable.
+  </Step>
+  <Step title="Verify the installation">
+    ```bash
+    watchexec --version
+    ```
+  </Step>
+</Steps>
+
+## Shell completions
+
+Watchexec provides completion scripts for bash, zsh, fish, elvish, nu, and PowerShell.
+
+If your installation method bundled completions, install them from the `completions/` directory in the extracted archive. If completions weren't bundled, generate them with:
+
+```bash
+watchexec --completions <shell>
+```
+
+Then install the output to the correct location for your shell:
+
+| Shell | Install path |
+|---|---|
+| bash | `/usr/share/bash-completion/completions/watchexec` |
+| zsh | `/usr/share/zsh/site-functions/_watchexec` |
+| fish | `/usr/share/fish/vendor_completions.d/watchexec.fish` |
+| elvish | `$XDG_CONFIG_HOME/elvish/completions/` |
+| nu | `$XDG_CONFIG_HOME/nu/completions/` |
+| PowerShell | `$PROFILE/` |
+
+<Note>
+On macOS with Homebrew, shell completions are typically installed automatically. Run `brew info watchexec` to confirm.
+</Note>
+
+## Manual page
+
+A manual page is included in binary releases at `doc/watchexec.1`. Install it to `/usr/share/man/man1/`.
+
+To generate it on demand:
+
+```bash
+watchexec --manual > /usr/share/man/man1/watchexec.1
+```
+
+To read it inline (requires `man`):
+
+```bash
+watchexec --manual
+```

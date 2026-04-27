@@ -1,0 +1,175 @@
+---
+title: "Setting up shell completions for watchexec"
+description: "Install or generate watchexec shell completions for bash, zsh, fish, elvish, nushell, and PowerShell — includes exact install paths for each shell."
+---
+
+Watchexec ships pre-built completion scripts for six shells. If your package manager installs them automatically, no further action is needed. If you installed watchexec from a binary archive or built it from source, follow the steps below for your shell.
+
+You can also generate completions on demand with `watchexec --completions <shell>` if the pre-built files are not available.
+
+<Tabs>
+  <Tab title="bash">
+    **Install the pre-built completion file:**
+
+    <Steps>
+      <Step title="Copy the completion file">
+        ```bash
+        sudo cp completions/bash /usr/share/bash-completion/completions/watchexec
+        ```
+      </Step>
+      <Step title="Reload your shell">
+        ```bash
+        source ~/.bashrc
+        ```
+      </Step>
+    </Steps>
+
+    **Or generate on the fly:**
+
+    ```bash
+    watchexec --completions bash | sudo tee /usr/share/bash-completion/completions/watchexec
+    ```
+
+    <Note>
+      bash-completion must be installed and sourced in your shell for completions to work. On Debian/Ubuntu: `sudo apt install bash-completion`.
+    </Note>
+  </Tab>
+
+  <Tab title="zsh">
+    **Install the pre-built completion file:**
+
+    <Steps>
+      <Step title="Copy the completion file">
+        ```bash
+        sudo cp completions/zsh /usr/share/zsh/site-functions/_watchexec
+        ```
+      </Step>
+      <Step title="Rebuild the completion cache">
+        ```bash
+        rm -f ~/.zcompdump && compinit
+        ```
+      </Step>
+    </Steps>
+
+    **Or generate on the fly:**
+
+    ```bash
+    watchexec --completions zsh | sudo tee /usr/share/zsh/site-functions/_watchexec
+    ```
+
+    <Tip>
+      If you use a user-local `fpath`, you can install to `~/.zfunc/_watchexec` instead and add `fpath=(~/.zfunc $fpath)` to your `.zshrc`.
+    </Tip>
+  </Tab>
+
+  <Tab title="fish">
+    **Install the pre-built completion file:**
+
+    <Steps>
+      <Step title="Copy the completion file">
+        ```bash
+        sudo cp completions/fish /usr/share/fish/vendor_completions.d/watchexec.fish
+        ```
+      </Step>
+    </Steps>
+
+    Fish loads completions automatically; no reload is needed.
+
+    **Or install to your user directory:**
+
+    ```bash
+    watchexec --completions fish > ~/.config/fish/completions/watchexec.fish
+    ```
+  </Tab>
+
+  <Tab title="elvish">
+    **Install the pre-built completion file:**
+
+    <Steps>
+      <Step title="Copy the completion file">
+        ```bash
+        cp completions/elvish $XDG_CONFIG_HOME/elvish/completions/watchexec.elv
+        ```
+      </Step>
+      <Step title="Source the file in rc.elv">
+        ```elvish
+        use path/to/completions/watchexec
+        ```
+      </Step>
+    </Steps>
+
+    **Or generate on the fly:**
+
+    ```bash
+    watchexec --completions elvish > $XDG_CONFIG_HOME/elvish/completions/watchexec.elv
+    ```
+  </Tab>
+
+  <Tab title="nushell">
+    **Install the pre-built completion file:**
+
+    <Steps>
+      <Step title="Copy the completion file">
+        ```bash
+        cp completions/nu $XDG_CONFIG_HOME/nu/completions/watchexec.nu
+        ```
+      </Step>
+      <Step title="Source it in your config.nu">
+        ```nu
+        source $"($env.XDG_CONFIG_HOME)/nu/completions/watchexec.nu"
+        ```
+      </Step>
+    </Steps>
+
+    **Or generate on the fly:**
+
+    ```bash
+    watchexec --completions nu | save $"($env.XDG_CONFIG_HOME)/nu/completions/watchexec.nu"
+    ```
+  </Tab>
+
+  <Tab title="PowerShell">
+    **Install the pre-built completion file:**
+
+    <Steps>
+      <Step title="Find your profile path">
+        ```powershell
+        echo $PROFILE
+        ```
+      </Step>
+      <Step title="Copy the completion file">
+        ```powershell
+        Copy-Item completions\powershell "$PROFILE\watchexec.ps1"
+        ```
+      </Step>
+      <Step title="Dot-source it in your profile">
+        Add the following line to `$PROFILE`:
+
+        ```powershell
+        . "$PSScriptRoot\watchexec.ps1"
+        ```
+      </Step>
+    </Steps>
+
+    **Or generate on the fly:**
+
+    ```powershell
+    watchexec --completions powershell | Out-File -Append $PROFILE
+    ```
+  </Tab>
+</Tabs>
+
+## Generating completions for any shell
+
+If pre-built completions are not available (for example, after building from source), generate them directly:
+
+```bash
+watchexec --completions bash
+watchexec --completions zsh
+watchexec --completions fish
+watchexec --completions elvish
+watchexec --completions nu
+watchexec --completions powershell
+```
+
+Redirect the output to the appropriate path for your shell as shown in the tabs above.

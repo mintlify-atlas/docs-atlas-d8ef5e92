@@ -1,0 +1,180 @@
+---
+title: "Watchexec struct: the core engine"
+description: "The Watchexec struct is the entry point for the watchexec library — create it with an action handler, set paths, and call main() to run."
+---
+
+The `Watchexec` struct is the central runtime for the watchexec library. It wires together event sources (filesystem, signals, keyboard), the throttle/debounce layer, the filterer, and your action handler into a single managed runtime. You construct it with an initial action handler, configure it through the `config` field, and then drive it by calling `main()`.
+
+## Constructors
+
+### `Watchexec::new`
+
+```rust
+pub fn new(
+    action_handler: impl (Fn(ActionHandler) -> ActionHandler) + Send + Sync + 'static,
+) -> Result<Arc<Self>, CriticalError>
+```
+
+Creates a new `Watchexec` instance with a synchronous action handler and returns it wrapped in an `Arc`. This is the most common constructor. The provided closure is set as the initial action handler on the internal `Config`; it can be replaced at any time via `wx.config.on_action(...)`.
+
+At minimum, your handler should call `action.quit()` when it receives a `Signal::Interrupt` (Ctrl-C) — without that, the process will not respond to Ctrl-C.
+
+### `Watchexec::new_async`
+
+```rust
+pub fn new_async(
+    action_handler: impl (Fn(ActionHandler) -> Box<dyn Future<Output = ActionHandler> + Send + Sync>)
+        + Send + Sync + 'static,
+) -> Result<Arc<Self>, CriticalError>
+```
+
+Same as `new`, but the action handler returns a `Future`. Use this when you need to `await` inside the handler. Prefer spawning tasks and using the synchronous variant where possible, since the handler blocks the event loop while it runs.
+
+### `Watchexec::with_config`
+
+```rust
+pub fn with_config(config: Config) -> Result<Self, CriticalError>
+```
+
+Constructs a `Watchexec` from a fully built `Config`. Returns `Self` directly (not wrapped in `Arc`). Use this when you need to set `error_channel_size` or `event_channel_size` before startup — those two fields cannot be changed after construction.
+
+### `Watchexec::default`
+
+```rust
+impl Default for Watchexec
+```
+
+Instantiates with a default `Config` and no-op action handler. Panics if construction fails — prefer `new()` in production code. The default configuration will start watchexec but do nothing, including not quit on Ctrl-C.
+
+## Fields
+
+### `wx.config`
+
+```rust
+pub config: Arc<Config>
+```
+
+The live configuration for this instance. Use the methods on [`Config`](/library/config) to change paths, filterers, throttle, and handlers at any time — before or after `main()` is called. Treat this field as read-only in terms of reassignment: replacing the `Arc<Config>` itself will not affect the running engine.
+
+## Methods
+
+### `wx.main()`
+
+```rust
+pub fn main(&self) -> JoinHandle<Result<(), CriticalError>>
+```
+
+Starts the watchexec engine and returns a `JoinHandle` that resolves when watchexec exits. Must be called exactly once — calling it a second time panics.
+
+The engine does not block `main()` itself; it spawns tasks internally. Await the returned handle to keep your program alive until watchexec quits.
+
+<Warning>
+Call `main()` before sending any events or the program will deadlock waiting for the start signal.
+</Warning>
+
+### `wx.send_event(event, priority)`
+
+```rust
+pub async fn send_event(
+    &self,
+    event: Event,
+    priority: Priority,
+) -> Result<(), CriticalError>
+```
+
+Injects a synthetic `Event` directly into the event channel, bypassing all event sources. Useful for triggering the action handler on startup, for testing, or for integrating custom event sources.
+
+Use `Event::default()` to send an empty event — empty events skip the filterer and always reach the action handler.
+
+```rust
+// trigger an initial run immediately after starting
+wx.send_event(Event::default(), Priority::Urgent).await?;
+```
+
+## ErrorHook
+
+```rust
+#[derive(Debug)]
+pub struct ErrorHook {
+    pub error: RuntimeError,
+    // ...
+}
+```
+
+`ErrorHook` is the type passed to the `Config::on_error` handler whenever a runtime error occurs inside watchexec. It is deliberately not `Clone` to discourage storing it outside the handler.
+
+<Note>
+Runtime errors are not the same as critical errors. Most runtime errors are recoverable and informational. Critical errors terminate watchexec.
+</Note>
+
+### `ErrorHook::critical(self, critical: CriticalError)`
+
+Escalates the current error handling run by emitting a `CriticalError`, which will terminate watchexec. Can only be called once; subsequent calls do nothing.
+
+### `ErrorHook::elevate(self)`
+
+Shorthand for `hook.critical(CriticalError::Elevated { ... })` — wraps the current `RuntimeError` into a `CriticalError` while preserving the original error info.
+
+## Lifecycle
+
+<Steps>
+  <Step title="Construct">
+    Call `Watchexec::new(handler)` with your action handler closure. This sets up all internal channels and spawns the main task, but the engine waits for `main()` before processing events.
+  </Step>
+  <Step title="Configure">
+    Use `wx.config.pathset([...])`, `wx.config.filterer(...)`, `wx.config.throttle(...)` and other `Config` methods to set up what to watch and how. Configuration can also be changed after `main()` is called.
+  </Step>
+  <Step title="Start">
+    Call `wx.main()` to release the engine. Store the returned `JoinHandle`.
+  </Step>
+  <Step title="Run">
+    Optionally send an initial event with `wx.send_event(Event::default(), Priority::Urgent).await` to trigger an immediate first action.
+  </Step>
+  <Step title="Quit">
+    Call `action.quit()` or `action.quit_gracefully(signal, grace)` inside the action handler. The `JoinHandle` from `main()` will resolve once shutdown is complete.
+  </Step>
+</Steps>
+
+## Complete example
+
+```rust
+use miette::{IntoDiagnostic, Result};
+use watchexec::Watchexec;
+use watchexec_signals::Signal;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let wx = Watchexec::new(|mut action| {
+        // print every event
+        for event in action.events.iter() {
+            eprintln!("EVENT: {event:?}");
+        }
+
+        // quit gracefully on Ctrl-C
+        if action.signals().any(|sig| sig == Signal::Interrupt) {
+            action.quit();
+        }
+
+        action
+    })?;
+
+    // watch the current directory
+    wx.config.pathset(["."]);
+
+    // start the engine and wait for it to finish
+    wx.main().await.into_diagnostic()?;
+    Ok(())
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Config reference" href="/library/config">
+    All runtime configuration options
+  </Card>
+  <Card title="Action handler" href="/library/action-handler">
+    Handling events, creating jobs, and quitting
+  </Card>
+  <Card title="Filterers" href="/library/filterers">
+    Controlling which events reach your handler
+  </Card>
+</CardGroup>

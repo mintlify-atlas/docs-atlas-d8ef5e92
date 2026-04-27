@@ -1,0 +1,166 @@
+---
+title: "Signal handling and process control in watchexec"
+description: "How watchexec sends, receives, and maps signals on Unix and Windows — stop signals, busy-update modes, signal mapping, and process wrapping."
+---
+
+Watchexec sits between your shell and the command it runs, which means it has to manage the full lifecycle of child processes: starting them, restarting them when files change, forwarding signals from the terminal, and cleaning them up on exit. Understanding how this works helps you avoid common pitfalls like zombie processes, runaway children, or signals that never reach your program.
+
+## Receiving signals
+
+When watchexec itself receives `SIGINT` (Ctrl-C) or `SIGTERM`, it exits gracefully, first stopping any running command. Other signals received by watchexec are forwarded to the child process.
+
+You can change this behaviour with `--map-signal` (see below).
+
+## Handling events while the command is running
+
+Use `--on-busy-update` / `-o` to control what watchexec does when a new event arrives while the command is still running:
+
+<AccordionGroup>
+  <Accordion title="do-nothing (default)">
+    Ignores events that arrive while the command is running. This prevents re-triggering caused by files the command itself writes, such as compilation outputs.
+
+    ```bash
+    watchexec make
+    ```
+  </Accordion>
+
+  <Accordion title="queue">
+    Waits for the current run to finish, then runs the command once more if any events arrived during the run.
+
+    ```bash
+    watchexec -o queue make
+    ```
+  </Accordion>
+
+  <Accordion title="restart">
+    Stops the running command and starts a new one immediately. This is the most useful mode for dev servers.
+
+    ```bash
+    watchexec -o restart node app.js
+    # shorthand:
+    watchexec -r node app.js
+    ```
+  </Accordion>
+
+  <Accordion title="signal">
+    Sends a signal to the running command without stopping it. Useful for programs that reload configuration on `SIGHUP`.
+
+    ```bash
+    watchexec -o signal --signal SIGHUP nginx
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Stop signal and timeout
+
+When watchexec needs to stop a running command (in restart mode, or on exit), it sends a graceful stop signal first and waits before force-killing.
+
+**`--stop-signal <SIGNAL>`** — the signal sent to stop the command. Defaults to `SIGTERM` on Unix.
+
+```bash
+# Stop with SIGKILL immediately (no graceful shutdown)
+watchexec -r --stop-signal SIGKILL my_server
+```
+
+Signal syntax is case-insensitive and accepts the full name (`SIGTERM`), short name (`TERM`), or number (`15`).
+
+**`--stop-timeout <TIMEOUT>`** — how long to wait after the stop signal before force-killing. Defaults to 10 seconds.
+
+```bash
+# Give the server 30 seconds to shut down cleanly
+watchexec -r --stop-timeout 30s my_server
+
+# Force-kill immediately
+watchexec -r --stop-timeout 0 my_server
+```
+
+## Sending a signal to a running command
+
+Use `--signal` / `-s` to send a specific signal to the command when it is already running. This implies `--on-busy-update=signal`.
+
+```bash
+# Send SIGHUP to trigger a config reload
+watchexec -n --signal SIGHUP my_server
+```
+
+<Note>
+  The `-n` flag (`--shell=none`) runs the command directly without a shell wrapper, which is often preferable when sending signals so that the signal reaches the intended process rather than the shell.
+</Note>
+
+## Mapping signals
+
+`--map-signal <SIGNAL:SIGNAL>` translates a signal received by watchexec into a different signal delivered to the child process.
+
+```bash
+# Pass Ctrl-C through to the command as SIGINT without quitting watchexec
+watchexec --map-signal INT:INT my_program
+
+# Translate SIGTERM to SIGINT for the child
+watchexec --map-signal TERM:INT my_program
+
+# Ignore SIGTERM entirely (watchexec will not quit and the child won't receive it)
+watchexec --map-signal TERM: my_program
+```
+
+<Warning>
+  If you map `SIGINT` or `SIGTERM`, those signals will no longer cause watchexec itself to quit. Make sure you have another way to stop watchexec.
+</Warning>
+
+The option can be specified multiple times to map multiple signals:
+
+```bash
+watchexec --map-signal TERM:INT --map-signal HUP: my_program
+```
+
+## Process wrapping
+
+By default, watchexec runs the command inside a process container so that signals and termination are delivered to all child processes, not just the immediate one.
+
+**`--wrap-process <MODE>`**
+
+| Mode | Unix behaviour | Windows behaviour |
+|---|---|---|
+| `group` (default on Linux) | Process group | Job Object |
+| `session` (default on macOS) | Process session | Job Object |
+| `none` | Direct child only | Direct child only |
+
+```bash
+# Use a process session (useful for some Unix programs)
+watchexec --wrap-process=session my_program
+
+# Disable wrapping entirely
+watchexec --wrap-process=none my_program
+```
+
+The deprecated `--no-process-group` flag is equivalent to `--wrap-process=none`.
+
+## Windows signals
+
+Windows does not have Unix-style signals. Watchexec maps the POSIX signal names to the closest Windows equivalents:
+
+| Unix signal | Windows event |
+|---|---|
+| `SIGKILL` | Terminate (KILL/STOP) |
+| `SIGINT` | `CTRL+C` |
+| `SIGTERM` | `CTRL+CLOSE` |
+| `SIGHUP` | `CTRL+BREAK` |
+
+<Note>
+  On Windows, `--stop-signal` only supports the `KILL` event. The `--stop-timeout` option has no practical effect because processes are always force-terminated.
+</Note>
+
+On Windows, you can also receive (but not deliver) `CTRL+C` and `CTRL+BREAK` events by name:
+
+```bash
+watchexec --map-signal CTRL+C:CTRL+BREAK my_program
+```
+
+## Exiting when stdin closes
+
+`--stdin-quit` tells watchexec to exit gracefully when its own stdin is closed. Some process managers use this convention to signal that child processes should stop.
+
+```bash
+watchexec --stdin-quit make
+```
+
+This option is incompatible with `--watch-file -` (reading watched paths from stdin).

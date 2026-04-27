@@ -1,0 +1,217 @@
+---
+title: "ignore-files: find and apply ignore patterns"
+description: "The ignore-files crate finds, parses, and applies .gitignore, .ignore, and other VCS ignore files, with support for ignore file trees and hierarchies."
+---
+
+The `ignore-files` crate discovers, loads, and evaluates ignore files across a project tree. Ignore files are files that contain gitignore-style patterns — `.gitignore`, `.hgignore`, `.ignore`, and others — and there can be many of them nested throughout a project at different directory levels. This crate walks that hierarchy, tracks which ignore file applies in which scope, and compiles everything into an `IgnoreFilter` that can match paths. It is used inside the watchexec filterer stack, but is also usable independently.
+
+## Adding to your project
+
+```toml
+[dependencies]
+ignore-files = "3"
+tokio = { version = "1", features = ["full"] }
+```
+
+## The `IgnoreFile` struct
+
+Each discovered ignore file is described by an `IgnoreFile`:
+
+```rust
+pub struct IgnoreFile {
+    /// Path to the ignore file on disk.
+    pub path: PathBuf,
+
+    /// The directory scope this file applies in.
+    /// `None` means the file is global (e.g. a user-level gitignore).
+    pub applies_in: Option<PathBuf>,
+
+    /// The VCS or project type this file is associated with, if any.
+    pub applies_to: Option<ProjectType>,
+}
+```
+
+`applies_in` is the root directory within which patterns from this file are evaluated. A `.gitignore` in `/home/user/project/src/` has `applies_in: Some("/home/user/project/src")`. A global git ignore (from `~/.gitignore` or `core.excludesFile`) has `applies_in: None`.
+
+`applies_to` is a `ProjectType` variant from the `project-origins` crate. It restricts the ignore file to a particular VCS context. For example, a `.gitignore` has `applies_to: Some(ProjectType::Git)`, while a `.ignore` file has `applies_to: None` (applies regardless of VCS).
+
+## Finding ignore files
+
+### `from_origin` — project-local ignore files
+
+`from_origin` walks a project directory tree and collects all ignore files it finds. It looks in the origin directory and all its subdirectories, skipping VCS metadata directories (`.git`, `.hg`, `.bzr`, `_darcs`, `.fossil-settings`, `.svn`).
+
+```rust
+use ignore_files::{from_origin, IgnoreFilesFromOriginArgs};
+
+let (files, errors) = from_origin("/home/user/project").await;
+
+// errors are non-fatal: log them but keep using what was found
+for err in &errors {
+    eprintln!("warning: {err}");
+}
+
+for file in &files {
+    println!("found: {} (applies_in: {:?})", file.path.display(), file.applies_in);
+}
+```
+
+`from_origin` discovers:
+
+| File | `applies_to` |
+|---|---|
+| `.gitignore` (any depth) | `Some(Git)` |
+| `.hgignore` (any depth) | `Some(Mercurial)` |
+| `.ignore` (any depth) | `None` |
+| `.git/info/exclude` (origin only) | `Some(Git)` |
+| `.bzrignore` (origin only) | `Some(Bazaar)` |
+| `_darcs/prefs/boring` (origin only) | `Some(Darcs)` |
+| `.fossil-settings/ignore-glob` (origin only) | `Some(Fossil)` |
+| `core.excludesFile` from `.git/config` | `Some(Git)`, `applies_in: None` |
+
+For more control, use `IgnoreFilesFromOriginArgs`:
+
+```rust
+use std::path::PathBuf;
+use ignore_files::{from_origin, IgnoreFilesFromOriginArgs};
+
+let args = IgnoreFilesFromOriginArgs::new(
+    "/home/user/project",
+    vec![PathBuf::from("/home/user/project/src")], // only watch src/
+    vec![PathBuf::from("/home/user/project/target")], // always ignore target/
+)?;
+
+let (files, errors) = from_origin(args).await;
+```
+
+### `from_environment` — user- and system-level ignore files
+
+`from_environment` finds global ignore files that apply to the current user environment, independently of any specific project. This includes:
+
+- User git ignore files (`~/.gitignore`, `$XDG_CONFIG_HOME/git/ignore`, `core.excludesFile` from global git config)
+- User Bazaar ignore files
+- Application-specific ignore files (`$XDG_CONFIG_HOME/{appname}/ignore`, `~/.{appname}/ignore`)
+
+```rust
+use ignore_files::from_environment;
+
+// Without app-specific ignores
+let (global_files, errors) = from_environment(None).await;
+
+// With app-specific ignores for your tool
+let (global_files, errors) = from_environment(Some("my-tool")).await;
+```
+
+<Note>
+When `from_origin` finds a project-local `core.excludesFile` in `.git/config`, it returns an `IgnoreFile` with `applies_in: None`. In that case, global Git ignore files found by `from_environment` should be disregarded, as the project has specified its own global ignore file.
+</Note>
+
+## Applying ignore patterns with `IgnoreFilter`
+
+`IgnoreFilter` compiles the list of `IgnoreFile`s into an efficient trie-based matcher.
+
+```rust
+use ignore_files::IgnoreFilter;
+use std::path::Path;
+
+let filter = IgnoreFilter::new("/home/user/project", &files).await?;
+
+// Check whether a path should be watched
+let path = Path::new("/home/user/project/target/debug/my-app");
+match filter.match_path(path, false) {
+    ignore::Match::Ignore(_) => println!("path is ignored"),
+    ignore::Match::Whitelist(_) => println!("path is explicitly un-ignored"),
+    ignore::Match::None => println!("path is not matched by any ignore rule"),
+}
+
+// Simpler boolean check for directories (used during traversal)
+if !filter.check_dir(path) {
+    println!("directory should be skipped");
+}
+```
+
+### Building incrementally
+
+If you discover ignore files one at a time (for example, as you traverse a directory tree), you can add them to a live `IgnoreFilter` without rebuilding from scratch:
+
+```rust
+let mut filter = IgnoreFilter::empty("/home/user/project");
+
+for file in files {
+    filter.add_file(&file).await?;
+}
+
+// Or add raw glob patterns directly:
+filter.add_globs(&["*.log", "tmp/"], Some(&origin_path))?;
+```
+
+Call `filter.finish()` to drop the internal builder and free memory once you are done adding files.
+
+## Complete example
+
+<Steps>
+  <Step title="Find all ignore files for a project">
+
+```rust
+use ignore_files::{from_origin, from_environment};
+
+let origin = std::path::Path::new("/home/user/my-project");
+
+// Global user-level ignores
+let (mut files, mut errors) = from_environment(Some("my-tool")).await;
+
+// Project-local ignores
+let (project_files, project_errors) = from_origin(origin).await;
+
+files.extend(project_files);
+errors.extend(project_errors);
+
+for err in &errors {
+    eprintln!("ignore discovery warning: {err}");
+}
+```
+
+  </Step>
+  <Step title="Build the filter">
+
+```rust
+use ignore_files::IgnoreFilter;
+
+let filter = IgnoreFilter::new(origin, &files).await?;
+```
+
+  </Step>
+  <Step title="Check paths">
+
+```rust
+use std::path::Path;
+use ignore::Match;
+
+let check = |p: &str| {
+    let path = Path::new(p);
+    match filter.match_path(path, false) {
+        Match::Ignore(_) => "ignored",
+        Match::Whitelist(_) => "allowed",
+        Match::None => "not matched",
+    }
+};
+
+println!("{}", check("/home/user/my-project/target/debug/app")); // "ignored" (Cargo)
+println!("{}", check("/home/user/my-project/src/main.rs"));      // "not matched"
+```
+
+  </Step>
+</Steps>
+
+## Notes on error handling
+
+Both `from_origin` and `from_environment` return `(Vec<IgnoreFile>, Vec<std::io::Error>)`. Errors are non-fatal: a missing file is silently skipped; permission errors and other I/O problems are returned alongside the successfully discovered files. The intended pattern is to log errors but continue using whatever was found.
+
+<CardGroup cols={2}>
+  <Card title="project-origins" icon="folder-tree" href="/library/project-origins">
+    `ProjectType` used in `IgnoreFile::applies_to` to scope ignore files by VCS type.
+  </Card>
+  <Card title="watchexec library" icon="book" href="/library/overview">
+    The watchexec filterer uses `ignore-files` internally to apply VCS ignore semantics.
+  </Card>
+</CardGroup>

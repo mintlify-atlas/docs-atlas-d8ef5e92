@@ -1,0 +1,176 @@
+---
+title: "Common watchexec use cases and examples"
+description: "Real-world examples for test runners, build systems, dev servers, linters, and custom automation using watchexec flags and options."
+---
+
+Watchexec handles a wide range of development automation tasks: running tests on save, rebuilding projects, restarting servers, linting code, and piping events to custom scripts. The examples below cover the most common patterns, grouped by category.
+
+<AccordionGroup>
+  <Accordion title="Test runners">
+    Run your test suite automatically whenever source files change.
+
+    **Rust**
+
+    ```bash
+    watchexec -e rs cargo test
+    ```
+
+    **Python**
+
+    ```bash
+    watchexec -e py pytest
+    ```
+
+    **JavaScript / TypeScript (Jest)**
+
+    ```bash
+    watchexec -e js,ts npx jest
+    ```
+
+    <Tip>
+      Use `-e` to restrict events to specific file extensions, so watchexec does not trigger on unrelated files like build outputs or documentation.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="Build systems">
+    Rebuild artifacts whenever sources change.
+
+    **Make (any change)**
+
+    ```bash
+    watchexec make
+    ```
+
+    **Web assets (JS, CSS, HTML)**
+
+    ```bash
+    watchexec -e js,css,html npm run build
+    ```
+
+    **Rust**
+
+    ```bash
+    watchexec -e rs cargo build
+    ```
+
+    **Time your builds** with `--timings`:
+
+    ```bash
+    watchexec --timings -- make
+    ```
+
+    This prints how long each run takes alongside the command output.
+  </Accordion>
+
+  <Accordion title="Dev servers (restart mode)">
+    Use `-r` / `--restart` to stop and restart a long-running server process whenever files change.
+
+    **Python**
+
+    ```bash
+    watchexec -r -e py -- python server.py
+    ```
+
+    **Node.js**
+
+    ```bash
+    watchexec -r node app.js
+    ```
+
+    **Go**
+
+    ```bash
+    watchexec -r -e go go run .
+    ```
+
+    <Note>
+      In restart mode, watchexec sends `SIGTERM` to the running process, waits up to 10 seconds for it to exit, then force-kills it before starting the new run. Use `--stop-signal` and `--stop-timeout` to adjust this behaviour.
+    </Note>
+  </Accordion>
+
+  <Accordion title="Linters and formatters">
+    Run static analysis or formatting tools on every save.
+
+    **Rust (Clippy)**
+
+    ```bash
+    watchexec -e rs cargo clippy
+    ```
+
+    **Python (flake8)**
+
+    ```bash
+    watchexec -e py -- python -m flake8 .
+    ```
+  </Accordion>
+
+  <Accordion title="One-liners and advanced patterns">
+    **Run two commands in sequence**
+
+    ```bash
+    watchexec 'date; make'
+    ```
+
+    Commands are run inside a shell by default, so you can use `;`, `&&`, pipes, and other shell features.
+
+    **Watch a specific file**
+
+    ```bash
+    watchexec -w Gemfile bundle install
+    ```
+
+    **Trigger only on file creation**
+
+    ```bash
+    watchexec --fs-events create -- s3 sync . s3://my-bucket
+    ```
+
+    **Stream events as JSON (no command)**
+
+    ```bash
+    watchexec --only-emit-events --emit-events-to=json-stdio
+    ```
+
+    **Desktop notifications**
+
+    ```bash
+    watchexec -N go build
+    ```
+
+    Watchexec emits a desktop notification when the command starts and ends on supported platforms.
+
+    **Watch `lib` and `src` simultaneously**
+
+    ```bash
+    watchexec -w lib -w src make
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Pairing with other tools
+
+Watchexec works well alongside several complementary tools:
+
+<CardGroup cols={3}>
+  <Card title="just" icon="terminal" href="/guides/common-use-cases">
+    A modern alternative to `make`. Pair with watchexec to run `just build` or `just test` on every change.
+
+    ```bash
+    watchexec just build
+    ```
+  </Card>
+  <Card title="checkexec" icon="circle-check" href="/guides/common-use-cases">
+    Runs a command only when source files are newer than a target file — useful for avoiding redundant builds.
+
+    ```bash
+    watchexec checkexec output src/**
+    ```
+  </Card>
+  <Card title="systemfd" icon="plug" href="/guides/common-use-cases">
+    Passes open sockets to child processes, avoiding address reuse issues when restarting dev servers.
+
+    ```bash
+    systemfd --no-pid -s http::3000 -- watchexec -r cargo run
+    ```
+  </Card>
+</CardGroup>

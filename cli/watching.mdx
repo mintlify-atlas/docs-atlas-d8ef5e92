@@ -1,0 +1,145 @@
+---
+title: "Watching files and directories with watchexec"
+description: "Reference for watchexec path-watching flags: --watch, --watch-non-recursive, --watch-file, --project-origin, --poll, and --debounce, with defaults."
+---
+
+The watching subsystem is the foundation of watchexec. It controls which paths are monitored, how the filesystem notification backend is selected, and how quickly events are grouped before triggering a command. By default, watchexec watches the current directory recursively using the operating system's native kernel-level notification mechanism (inotify on Linux, FSEvents on macOS, ReadDirectoryChangesW on Windows). You can narrow or expand coverage with the flags below, switch to polling for network-mounted filesystems, and tune the debounce window to balance responsiveness against spurious re-runs.
+
+## Watch paths
+
+<ParamField path="-w / --watch" type="PATH">
+  Watch a specific file or directory. Can be repeated to watch multiple paths.
+
+  **Default:** the current working directory (recursive).
+
+  When watching a single file, consider watching its containing directory and filtering on the filename instead. Some editors replace a file entirely when saving rather than modifying it in place, which can cause the watch to miss subsequent changes.
+
+  Passing `/dev/null` as the **only** watched path instructs watchexec to watch no paths at all. Other event sources such as signals and keypress events still work normally.
+
+  ```bash
+  # Watch the src/ directory
+  watchexec -w src make
+
+  # Watch two separate directories
+  watchexec -w lib -w src make
+
+  # Watch a single file
+  watchexec -w config/settings.toml -- systemctl reload myapp
+
+  # Watch no paths (signal-only mode)
+  watchexec -w /dev/null --on-busy-update=signal -s SIGHUP myapp
+  ```
+</ParamField>
+
+<ParamField path="-W / --watch-non-recursive" type="PATH">
+  Watch a specific directory **without** recursing into subdirectories. Can be repeated.
+
+  Use this when you only care about changes directly inside a directory and want to avoid the overhead of watching a deeply nested tree, or when recursive watching produces too many events.
+
+  ```bash
+  # Watch only files directly inside dist/, not subdirectories
+  watchexec -W dist -- rsync -a dist/ remote:dist/
+
+  # Combine recursive and non-recursive watches
+  watchexec -w src -W config make
+  ```
+</ParamField>
+
+<ParamField path="-F / --watch-file" type="PATH">
+  Read a list of paths to watch from a file, one per line. Each line is treated as if it were passed to `-w`.
+
+  The special value `-` reads from standard input. This is incompatible with `--stdin-quit` and `--interactive`.
+
+  For more complex use cases—such as mixing recursive and non-recursive paths—use the `@argfile` mechanism instead: create a file containing full command-line arguments and pass it as `@path/to/argfile`.
+
+  ```bash
+  # Read paths from a file
+  echo -e "src\nlib\nconfig" > watch-paths.txt
+  watchexec -F watch-paths.txt make
+
+  # Read paths from stdin
+  find . -name '*.go' -printf '%h\n' | sort -u | watchexec -F - go build ./...
+  ```
+</ParamField>
+
+## Project origin
+
+<ParamField path="--project-origin" type="DIRECTORY">
+  Override the automatically detected project root.
+
+  Watchexec searches for markers such as `.git`, `.hg`, `.svn`, `Cargo.toml`, `package.json`, and others to determine the project origin. This origin is used to:
+
+  - Resolve the path of ignore files (`.gitignore`, `.ignore`, etc.)
+  - Detect which VCS is in use
+  - Interpret a leading `/` in filter and ignore patterns
+
+  If detection is wrong, or if you want to speed up startup by skipping the search entirely, supply the correct directory with this flag.
+
+  ```bash
+  # Force the project root to a parent monorepo directory
+  watchexec --project-origin /projects/monorepo -w packages/mylib make
+
+  # Useful when watchexec is invoked from a subdirectory
+  watchexec --project-origin . make
+  ```
+</ParamField>
+
+## Polling mode
+
+<ParamField path="--poll" type="INTERVAL">
+  Use filesystem polling instead of the OS's native notification mechanism.
+
+  **Default interval when flag is given without a value:** `30s`.
+
+  Polling is less efficient than kernel-level watching but works reliably with network-mounted filesystems (NFS, SMB, SSHFS), certain containerised environments, and exotic file systems where native events are not delivered.
+
+  The interval accepts a bare number in milliseconds (deprecated; prefer explicit units) or a human-readable duration such as `"500ms"`, `"2s"`, or `"1min 30s"`.
+
+  Also aliased as `--force-poll`.
+
+  <Warning>
+    Polling can be significantly more CPU- and I/O-intensive than native watching, especially on large directory trees with short intervals. Choose the longest interval that still meets your latency requirements.
+  </Warning>
+
+  ```bash
+  # Poll with the default 30-second interval
+  watchexec --poll make
+
+  # Poll every 5 seconds (useful for network shares)
+  watchexec --poll 5s make
+
+  # Poll every 500 milliseconds
+  watchexec --poll 500ms npm run build
+  ```
+</ParamField>
+
+## Debounce
+
+<ParamField path="-d / --debounce" type="TIMEOUT" default="50ms">
+  Time to wait for new events before acting on any of them.
+
+  **Default:** `50ms`.
+
+  What appears to be a single save operation can generate many filesystem events in quick succession—especially with editors that write atomically by replacing files, or build tools that touch many files at once. The debounce window collects all events that arrive within this period and then processes them together as one batch, preventing watchexec from running the command dozens of times for a single logical change.
+
+  Accepts a human-readable duration such as `"50ms"`, `"1s"`, or `"5sec 200ms"`. A bare number in milliseconds is also accepted but deprecated.
+
+  <Note>
+    Setting debounce to `0` is strongly discouraged. It disables event batching entirely and can cause the command to run an excessive number of times for a single operation.
+  </Note>
+
+  <Tip>
+    You can deliberately set a very high debounce (e.g. `"30min"`) to create an ad-hoc throttle—for example, running a bandwidth-intensive backup only once per half-hour regardless of how many files change. Keep in mind that accumulated events are held in memory.
+  </Tip>
+
+  ```bash
+  # Use a 200ms debounce for a slower build pipeline
+  watchexec -d 200ms make
+
+  # Use a 2-second debounce to batch many rapid file saves
+  watchexec -d 2s npm run test
+
+  # Throttle a backup script to run at most once every 10 minutes
+  watchexec -d 10min ./backup.sh
+  ```
+</ParamField>

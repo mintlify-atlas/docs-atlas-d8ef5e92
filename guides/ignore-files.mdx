@@ -1,0 +1,124 @@
+---
+title: "Using ignore files with watchexec"
+description: "How watchexec discovers and applies .gitignore, .ignore, and other VCS ignore files, plus custom ignore configuration and override flags."
+---
+
+Watchexec uses a layered ignore system: built-in defaults are applied first, then project-level VCS ignore files, then global user ignore files, and finally any patterns you supply explicitly on the command line. Each layer can be disabled independently, giving you precise control over what watchexec watches.
+
+## Default ignores
+
+Out of the box, watchexec ignores a set of files and directories that are almost never relevant to watch:
+
+- Editor swap files (e.g. `.swp`, `#*#`)
+- `*.pyc`, `*.pyo`
+- `.DS_Store`
+- VCS directories: `.bzr`, `_darcs`, `.fossil-settings`, `.git`, `.hg`, `.pijul`, `.svn`
+- Watchexec log files
+
+To disable the built-in defaults:
+
+```bash
+watchexec --no-default-ignore make
+```
+
+## VCS ignore files
+
+When watchexec detects a version control system in the project, it loads the corresponding ignore files. Only the VCS that is actually in use is loaded — for example, a `.bzrignore` in a Git repository is silently discarded.
+
+| VCS | Files loaded |
+|---|---|
+| Git | `.gitignore` at project root and child directories, `.git/info/exclude`, file pointed to by `core.excludesFile` in `.git/config` |
+| Mercurial | `.hgignore` at project root and child directories |
+| Bazaar | `.bzrignore` at project root |
+| Darcs | `_darcs/prefs/boring` |
+| Fossil | `.fossil-settings/ignore-glob` |
+| Generic | `.ignore` at project root and child directories |
+
+To disable VCS ignore files (while still loading `.ignore` and global ignores):
+
+```bash
+watchexec --no-vcs-ignore make
+```
+
+To disable all project-local ignore files (VCS and generic):
+
+```bash
+watchexec --no-project-ignore make
+```
+
+<Note>
+  The `.ignore` file uses the same glob pattern syntax as `.gitignore` and is always loaded regardless of which VCS is in use. It is the recommended way to add watchexec-specific ignore rules without modifying VCS config.
+</Note>
+
+## Global and user ignores
+
+Watchexec also loads ignore files from the user's home directory and config locations.
+
+**Git global excludes** — the first found of:
+- The file at the path set by `core.excludesFile` (if configured)
+- `$XDG_CONFIG_HOME/git/ignore`
+- `%APPDATA%/.gitignore` (Windows)
+- `%USERPROFILE%/.gitignore` (Windows)
+- `$HOME/.config/git/ignore`
+- `$HOME/.gitignore`
+
+**Bazaar global ignores** — the first found of:
+- `%APPDATA%/Bazzar/2.0/ignore` (Windows)
+- `$HOME/.bazaar/ignore`
+
+**Watchexec global ignores** — the first found of:
+- `$XDG_CONFIG_HOME/watchexec/ignore`
+- `%APPDATA%/watchexec/ignore` (Windows)
+- `%USERPROFILE%/.watchexec/ignore` (Windows)
+- `$HOME/.watchexec/ignore`
+
+<Tip>
+  Use the watchexec global ignore file (`$XDG_CONFIG_HOME/watchexec/ignore`) to apply ignore rules across all your projects without modifying any project files.
+</Tip>
+
+To disable all global/user ignore files:
+
+```bash
+watchexec --no-global-ignore make
+```
+
+## Override flags
+
+| Flag | Effect |
+|---|---|
+| `--no-default-ignore` | Disable built-in default ignores |
+| `--no-project-ignore` | Disable project-local ignore files (`.gitignore`, `.ignore`, etc.) |
+| `--no-vcs-ignore` | Disable VCS-specific ignore files only |
+| `--no-global-ignore` | Disable global/user ignore files |
+| `--no-discover-ignore` | Skip all ignore discovery (equivalent to `--no-global-ignore --no-vcs-ignore --no-project-ignore`) |
+| `--ignore-nothing` | Disable both default ignores and all discovered ignores (shorthand for `--no-default-ignore --no-discover-ignore`) |
+
+<Warning>
+  Even with `--ignore-nothing`, patterns supplied via `--ignore`, `--ignore-file`, or `$WATCHEXEC_IGNORE_FILES` are still applied. Use `--ignore-nothing` to strip automatic ignores without losing your explicit rules.
+</Warning>
+
+## Adding custom ignore patterns
+
+**On the command line** — use `-i` / `--ignore` (can be repeated):
+
+```bash
+watchexec -i "target/**" -i "*.log" make
+```
+
+**From a file** — use `--ignore-file`:
+
+```bash
+watchexec --ignore-file .watchexec-ignore make
+```
+
+The file format is one glob pattern per line. Empty lines and lines starting with `#` are ignored.
+
+**Via environment variable** — set `$WATCHEXEC_IGNORE_FILES` to a colon-separated (Unix) or semicolon-separated (Windows) list of ignore file paths:
+
+```bash
+WATCHEXEC_IGNORE_FILES=/home/user/.watchexec-ignore watchexec make
+```
+
+<Note>
+  Patterns in `--ignore` / `--ignore-file` use the same glob syntax as gitignore. A leading `/` anchors the pattern to the project root; `**` matches across directory boundaries.
+</Note>

@@ -1,0 +1,138 @@
+---
+title: "Watchexec Rust library: build file-watching tools"
+description: "The watchexec crate provides file watching, event filtering, and process supervision for building custom Rust tools powered by the same engine as the CLI."
+---
+
+The `watchexec` crate is the engine that powers the Watchexec CLI — packaged as a reusable Rust library so you can build your own file-watching tools on top of it. If you need custom filtering logic, programmatic control over watched paths, or tight integration with process lifecycle management, the library gives you all of that without reimplementing the plumbing. It is async-first (built on [Tokio](https://tokio.rs)) and designed to be embedded in larger applications.
+
+## What the library provides
+
+The library is organized around three core pieces that work together:
+
+**`Watchexec` struct** — the main entry point. Construct it with an action handler, call `wx.main()` to start the runtime, and use `wx.config` to reconfigure it at any time — including from within the action handler itself.
+
+**`Config`** — a live configuration object where almost every field is a `Changeable`, meaning it can be updated from a shared reference (`&self`) at any time without restarting the engine. Key settings include:
+
+| Setting | Description |
+|---|---|
+| `pathset` | Filesystem paths to watch |
+| `file_watcher` | Watcher backend (recommended: let the library choose) |
+| `keyboard_events` | Enable raw-mode stdin key events |
+| `throttle` | Debounce window before triggering an action (default: 50 ms) |
+| `filterer` | Pluggable event filterer implementation |
+| `on_error` | Handler for runtime errors |
+| `on_action` / `on_action_async` | The main action handler |
+
+**Action handler** — a closure called with an `ActionHandler` every time events pass through the filterer. Inside it you inspect events, manage jobs, and optionally quit. The handler must return quickly; spawn tasks or use channels for heavy work.
+
+### Event sources
+
+The library provides three built-in event sources, all accessible from `watchexec::sources`:
+
+- **Filesystem** — powered by `notify`, watches the paths you configure and emits create/modify/remove/rename events.
+- **Signals** — captures process signals (SIGINT, SIGTERM, etc.) and surfaces them as typed `Signal` values in your action handler.
+- **Keyboard** — optional raw-mode stdin source that emits individual key events and EOF; useful for interactive TUI tools.
+
+### Job management
+
+Process supervision is provided by the `watchexec-supervisor` crate (re-exported as `watchexec::job` and `watchexec::command`). From the action handler you can:
+
+- `action.create_job(command)` — create and track a new supervised process.
+- `action.get_or_create_job(id, command_fn)` — idempotently get or create a named job (useful for stable build/run pairs).
+- `job.start()` / `job.restart()` / `job.stop_with_signal(signal, timeout)` — control process lifecycle.
+- `job.to_wait().await` — await process exit.
+- `job.run(|context| { … })` — inspect the job's current `CommandState` (running, finished, etc.).
+
+## Companion crates
+
+These crates are maintained in the same repository and are the building blocks watchexec is assembled from. You can use them independently.
+
+<CardGroup cols={2}>
+  <Card title="watchexec-events" icon="bolt" href="/library/events">
+    Event types used throughout the library, including the JSON format used to pass event data to child processes.
+  </Card>
+  <Card title="watchexec-signals" icon="tower-broadcast" href="/library/signals">
+    Cross-platform signal types (`Signal` enum) used in event sources and job control.
+  </Card>
+  <Card title="watchexec-supervisor" icon="server" href="/library/supervisor">
+    Process supervisor and command abstraction. Manages jobs, process groups, and lifecycle.
+  </Card>
+  <Card title="watchexec-filterer-globset" icon="filter" href="/library/filterers">
+    Default CLI-style filtering based on glob patterns, implemented with the `globset` crate.
+  </Card>
+  <Card title="watchexec-filterer-ignore" icon="file-x" href="/library/filterers">
+    Ignore-file semantics (`.gitignore`, `.watchexecignore`, etc.) supporting trees of ignore files.
+  </Card>
+  <Card title="ignore-files" icon="folder-minus" href="/library/ignore-files">
+    Finds, parses, and interprets ignore files; used as a subfilterer in both main filterers.
+  </Card>
+  <Card title="project-origins" icon="map-pin" href="/library/project-origins">
+    Detects the root path of a project and identifies its type (Cargo, Node, Git, etc.).
+  </Card>
+</CardGroup>
+
+## Architecture overview
+
+Events flow through the library in a straight pipeline:
+
+```
+Event sources          Filterer               Action handler         Jobs
+─────────────      ─────────────────      ──────────────────     ──────────
+Filesystem    ───▶                    ───▶                    ───▶
+Signals       ───▶  pass / drop       ───▶  your closure      ───▶  watchexec-supervisor
+Keyboard      ───▶                    ───▶                    ───▶
+```
+
+Events from all sources are multiplexed into a single channel. The filterer decides which events reach your action handler. Inside the handler you react to events and drive jobs. The `Config`'s `throttle` setting controls how long the library waits to accumulate events before calling the handler (trailing-edge debounce, default 50 ms).
+
+## When to use the library vs the CLI
+
+Use the **CLI** when you want to run an arbitrary shell command in response to file changes and don't need to embed the logic in another Rust program.
+
+Use the **library** when you need to:
+
+- Build a specialized tool (like `cargo-watch` or `ghciwatch`) with its own UX and configuration.
+- Apply custom filtering logic that glob/ignore files alone can't express.
+- Manage process lifecycle programmatically — inspecting exit codes, restarting selectively, coordinating multiple processes.
+- Integrate file-watching into a larger async Rust application.
+
+## Known downstreams
+
+The library is production-proven. Tools that use it today include:
+
+| Tool | Description |
+|---|---|
+| [cargo-watch](https://github.com/watchexec/cargo-watch) | Watches Cargo projects and reruns cargo commands on change |
+| [cargo-lambda](https://www.cargo-lambda.info/) | Compiles and runs AWS Lambda functions locally |
+| [ghciwatch](https://github.com/MercuryTechnologies/ghciwatch) | GHCi session manager for Haskell development |
+
+## MSRV policy
+
+The library tracks the **latest stable Rust** and does not guarantee a minimum supported version behind stable. Dependencies change their own MSRV unpredictably, making a fixed floor impractical.
+
+<Warning>
+If you are building an application that needs to support older Rust toolchains, use a lock file and recommend `--locked` when users install from source. Provide pre-built binaries where possible and consider [Binstall](https://github.com/cargo-bins/cargo-binstall) support.
+</Warning>
+
+## Explore the library
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/library/quickstart">
+    Add the crate to your project and write your first action handler.
+  </Card>
+  <Card title="Watchexec struct" icon="circle-play" href="/library/watchexec">
+    Reference for constructing and running the `Watchexec` engine.
+  </Card>
+  <Card title="Config" icon="sliders" href="/library/config">
+    All configuration options and how live reconfiguration works.
+  </Card>
+  <Card title="Action handler" icon="code" href="/library/action-handler">
+    What the action handler receives and the operations it can perform.
+  </Card>
+  <Card title="Filterers" icon="filter" href="/library/filterers">
+    Built-in filterers and how to implement your own.
+  </Card>
+  <Card title="Supporting crates" icon="boxes" href="/library/events">
+    Events, signals, supervisor, and other standalone crates.
+  </Card>
+</CardGroup>

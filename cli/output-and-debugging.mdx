@@ -1,0 +1,259 @@
+---
+title: "Output options and debugging watchexec"
+description: "Reference for watchexec output and diagnostic flags: --clear, --notify, --timings, --quiet, --color, --print-events, --verbose, --log-file, and more."
+---
+
+By default, watchexec prints a short message when a command starts and stops and passes the command's own output through unchanged. The flags on this page let you suppress or augment that output—clearing the screen between runs, sending desktop notifications, timing commands—and enable the diagnostic tools you need when filtering behaves unexpectedly or you need to file a bug report.
+
+## Screen and terminal output
+
+<ParamField path="-c / --clear" type="MODE">
+  Clear the terminal screen before each command run.
+
+  If the basic clear mode does not fully clear your terminal (for example, if scrollback content bleeds through), use `--clear=reset` for a full terminal reset.
+
+  | Mode | Behaviour |
+  |---|---|
+  | `clear` (default when flag is given) | Equivalent to the `clear` command |
+  | `reset` | Full terminal reset, including scrollback |
+
+  ```bash
+  # Clear before each run
+  watchexec -c make test
+
+  # Full reset before each run
+  watchexec --clear=reset make
+  ```
+</ParamField>
+
+<ParamField path="--bell" type="boolean">
+  Ring the terminal bell when the command finishes.
+
+  Useful when you want an audio cue that a long-running build or test suite has completed, without having to watch the terminal.
+
+  ```bash
+  watchexec --bell make test
+  ```
+</ParamField>
+
+<ParamField path="-N / --notify" type="WHEN">
+  Send a desktop notification when the command starts and/or ends. Supported on macOS, Linux (via libnotify), and Windows.
+
+  On unsupported platforms, the flag may silently do nothing or log a warning.
+
+  | Mode | Behaviour |
+  |---|---|
+  | `both` (default when flag is given) | Notify on start and end |
+  | `start` | Notify only when the command starts |
+  | `end` | Notify only when the command ends |
+
+  ```bash
+  # Notify on both start and end (default mode)
+  watchexec -N make
+
+  # Notify only when the command finishes
+  watchexec --notify=end make test
+  ```
+</ParamField>
+
+<ParamField path="--timings" type="boolean">
+  Print how long each command run took.
+
+  Timing includes a small amount of watchexec overhead and is not suitable for precise benchmarking. Use the `time` utility or a dedicated benchmarking tool for accurate measurements.
+
+  ```bash
+  watchexec --timings make test
+  ```
+</ParamField>
+
+<ParamField path="-q / --quiet" type="boolean">
+  Suppress the start and stop messages that watchexec prints around each command run.
+
+  Only the command's own stdout and stderr, plus watchexec warnings and errors, are printed.
+
+  ```bash
+  watchexec -q make
+  ```
+</ParamField>
+
+<ParamField path="--color" type="MODE" default="auto">
+  Control when watchexec uses terminal colours in its own output.
+
+  | Mode | Behaviour |
+  |---|---|
+  | `auto` | Use colour when connected to a terminal (default) |
+  | `always` | Always use colour |
+  | `never` | Never use colour |
+
+  Setting the environment variable `NO_COLOR` to any value is equivalent to `--color=never`, following the [no-color.org](https://no-color.org) convention.
+
+  Also aliased as `--colour`.
+
+  ```bash
+  watchexec --color=always make 2>&1 | tee build.log
+
+  # Disable colour via environment variable
+  NO_COLOR=1 watchexec make
+  ```
+</ParamField>
+
+## Diagnostic tools
+
+<ParamField path="--print-events" type="boolean">
+  Print the events that triggered each action, in human-readable form, after debouncing.
+
+  This is the first tool to reach for when your filters are not working as expected. It shows you exactly which events watchexec saw and acted on.
+
+  For deeper diagnostic information—such as what the file system notifier is doing internally—use `-vvv` instead.
+
+  ```bash
+  watchexec --print-events make
+  ```
+
+  Example output:
+
+  ```text
+  [Running: make]
+  Event { tags: [Path("/home/user/project/src/main.rs", Some(File)), Fs { simple: Modify }] }
+  ```
+</ParamField>
+
+<ParamField path="-v / --verbose" type="boolean">
+  Enable diagnostic logging. Repeat to increase verbosity.
+
+  | Flag | Log level | What you see |
+  |---|---|---|
+  | `-v` | warn | Warnings only |
+  | `-vv` | info | General operational information |
+  | `-vvv` | debug | Detailed internal state; use this for bug reports |
+  | `-vvvv` | trace | Full trace including span events |
+
+  <Tip>
+    When filing a bug report, capture output at `-vvv`. This level includes detailed information about event sources, filter decisions, and process management without generating an overwhelming volume of trace data.
+  </Tip>
+
+  The environment variable `$WATCHEXEC_LOG` can also set the log level and takes precedence over `-v`. It is the only way to capture logs from before argument parsing occurs.
+
+  ```bash
+  # Basic diagnostics
+  watchexec -v make
+
+  # Bug report level
+  watchexec -vvv make 2>watchexec-debug.log
+
+  # Via environment variable
+  WATCHEXEC_LOG=debug watchexec make
+  ```
+</ParamField>
+
+<ParamField path="--log-file" type="PATH">
+  Write diagnostic logs to a file in JSON format instead of (or in addition to) the terminal.
+
+  If no path is provided, the log file is created in the current working directory. If a directory is provided, a timestamped file is created inside it with the name format `watchexec.YYYY-MM-DDTHH-MM-SSZ.log`.
+
+  If no verbosity level is already set, `--log-file` implicitly sets `-vvv`.
+
+  <Warning>
+    If you use `--ignore-nothing` alongside `--log-file`, watchexec will detect its own log writes as filesystem events and may loop. Place the log file outside the watched directory to avoid this.
+  </Warning>
+
+  ```bash
+  # Write logs to the current directory (auto-named file)
+  watchexec --log-file make
+
+  # Write logs to a specific file
+  watchexec --log-file /tmp/watchexec.log make
+
+  # Write logs to a directory (timestamped filename)
+  watchexec --log-file /var/log/watchexec/ make
+
+  # Combine with explicit verbosity
+  watchexec -vvv --log-file /tmp/watchexec.log make
+  ```
+</ParamField>
+
+## Event emission mode
+
+<ParamField path="--only-emit-events" type="boolean">
+  Emit event JSON to stdout and run no command.
+
+  Use this when you want to use watchexec purely as a file watcher that feeds events into another tool, without spawning any child processes. It is more efficient than using `cat` as the command because no process is forked per event.
+
+  This flag implies `--emit-events-to=json-stdio`. You can switch to plain text by also passing `--emit-events-to=stdio`.
+
+  ```bash
+  # Pipe watchexec events into a custom handler
+  watchexec --only-emit-events | jq '.tags[] | select(.kind == "path") | .absolute'
+
+  # Use text format instead of JSON
+  watchexec --only-emit-events --emit-events-to=stdio
+  ```
+</ParamField>
+
+## Shell completions and manual
+
+<ParamField path="--completions" type="SHELL">
+  Generate a shell completions script for the given shell and print it to stdout.
+
+  Supported shells: `bash`, `elvish`, `fish`, `nu`, `powershell`, `zsh`.
+
+  Some distributions ship pre-generated completions. Use this flag to generate them yourself if they are not included.
+
+  <CodeGroup>
+
+  ```bash bash
+  watchexec --completions bash > ~/.local/share/bash-completion/completions/watchexec
+  ```
+
+  ```bash zsh
+  watchexec --completions zsh > ~/.zfunc/_watchexec
+  ```
+
+  ```bash fish
+  watchexec --completions fish > ~/.config/fish/completions/watchexec.fish
+  ```
+
+  ```bash PowerShell
+  watchexec --completions powershell >> $PROFILE
+  ```
+
+  </CodeGroup>
+</ParamField>
+
+<ParamField path="--manual" type="boolean">
+  Show the watchexec manual page.
+
+  If a terminal and the `man` program are available, the manual is displayed interactively. Otherwise, it is printed to stdout in ROFF format, suitable for saving to a `watchexec.1` file.
+
+  ```bash
+  watchexec --manual
+
+  # Save as a man page
+  watchexec --manual > /usr/local/share/man/man1/watchexec.1
+  ```
+</ParamField>
+
+## Argument files
+
+Watchexec supports loading arguments from a file using the `@argfile` syntax. Pass `@path/to/file` as the first argument; each line of the file is treated as one argument and inserted in place of the `@argfile` reference. Arguments provided on the command line after the `@argfile` reference override or extend those in the file.
+
+```bash
+# Create an argfile
+cat > .watchexec-args <<'EOF'
+-w
+src
+-e
+rs
+--clear
+EOF
+
+# Use it
+watchexec @.watchexec-args cargo test
+
+# CLI args still apply and can override
+watchexec @.watchexec-args --no-default-ignore cargo test
+```
+
+<Note>
+  The `@argfile` expansion only applies before the first `--` double-dash separator. Arguments after `--` are passed verbatim to the command.
+</Note>

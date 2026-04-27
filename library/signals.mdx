@@ -1,0 +1,218 @@
+---
+title: "watchexec-signals: cross-platform signal types"
+description: "The watchexec-signals crate defines the Signal enum with cross-platform signal names and conversion from OS signals for use in watchexec handlers."
+---
+
+The `watchexec-signals` crate provides a single `Signal` type that covers the signals watchexec cares about in a cross-platform way. Rather than using raw signal numbers or platform-specific types directly, the ecosystem represents all signal concepts — whether they originate from Unix `kill`, Windows control events, or watchexec's own action handler — through this enum. It is used in `watchexec-events` tags, in the supervisor's `Job` API, and in action handler callbacks.
+
+## Adding to your project
+
+```toml
+[dependencies]
+watchexec-signals = "5"
+
+# For JSON support:
+watchexec-signals = { version = "5", features = ["serde"] }
+
+# Minimal (no FromStr, no rich diagnostics):
+watchexec-signals = { version = "5", default-features = false }
+```
+
+### Feature flags
+
+| Feature | Default | Description |
+|---|---|---|
+| `fromstr` | yes | `FromStr` / `from_unix_str` / `from_windows_str` |
+| `miette` | yes | Rich diagnostic error types via `miette` |
+| `serde` | no | `Serialize` / `Deserialize` implementations |
+
+## The `Signal` enum
+
+```rust
+#[non_exhaustive]
+pub enum Signal {
+    Hangup,     // Unix: SIGHUP    / Windows: CTRL-CLOSE (future)
+    ForceStop,  // Unix: SIGKILL   / Windows: TerminateProcess
+    Interrupt,  // Unix: SIGINT    / Windows: CTRL-C (future)
+    Quit,       // Unix: SIGQUIT   / Windows: ignored
+    Terminate,  // Unix: SIGTERM   / Windows: CTRL-BREAK (future)
+    User1,      // Unix: SIGUSR1   / Windows: ignored
+    User2,      // Unix: SIGUSR2   / Windows: ignored
+    Custom(i32),// any other signal number
+}
+```
+
+The enum is `#[non_exhaustive]`, so match arms should include a catch-all when handling arbitrary signals.
+
+## Platform mapping
+
+<AccordionGroup>
+  <Accordion title="Unix signal numbers → Signal variants">
+
+Conversion via `From<i32>` uses hardcoded POSIX-standard numbers:
+
+| Raw number | Variant |
+|---|---|
+| 1 | `Hangup` (SIGHUP) |
+| 2 | `Interrupt` (SIGINT) |
+| 3 | `Quit` (SIGQUIT) |
+| 9 | `ForceStop` (SIGKILL) |
+| 10 | `User1` (SIGUSR1) |
+| 12 | `User2` (SIGUSR2) |
+| 15 | `Terminate` (SIGTERM) |
+| other | `Custom(n)` |
+
+  </Accordion>
+  <Accordion title="Nix Signal → Signal variants">
+
+On Unix targets, use `Signal::from_nix(nix_signal)` for a type-safe conversion from `nix::sys::signal::Signal`, or `Signal::to_nix(self)` to go the other way.
+
+```rust
+use watchexec_signals::Signal;
+use nix::sys::signal::Signal as NixSignal;
+
+let sig = Signal::from_nix(NixSignal::SIGHUP);
+assert_eq!(sig, Signal::Hangup);
+
+let nix = Signal::Terminate.to_nix();
+assert_eq!(nix, Some(NixSignal::SIGTERM));
+```
+
+  </Accordion>
+  <Accordion title="Windows control event names → Signal variants">
+
+`Signal::from_windows_str` maps Windows console control event names (case-insensitive) to the nearest Unix equivalents:
+
+| Windows name | Variant |
+|---|---|
+| `CTRL-CLOSE`, `CTRL+CLOSE`, `CLOSE` | `Hangup` |
+| `CTRL-BREAK`, `CTRL+BREAK`, `BREAK` | `Terminate` |
+| `CTRL-C`, `CTRL+C`, `C` | `Interrupt` |
+| `KILL`, `SIGKILL`, `FORCE-STOP`, `STOP` | `ForceStop` |
+
+  </Accordion>
+</AccordionGroup>
+
+## Parsing from strings
+
+With the `fromstr` feature (default), `Signal` implements `FromStr`. It tries Windows control event names first, then Unix signal names and numbers. Parsing is case-insensitive and accepts both short names (`INT`, `HUP`) and long names (`SIGINT`, `SIGHUP`).
+
+```rust
+use std::str::FromStr;
+use watchexec_signals::Signal;
+
+assert_eq!(Signal::from_str("SIGINT").unwrap(), Signal::Interrupt);
+assert_eq!(Signal::from_str("hup").unwrap(), Signal::Hangup);
+assert_eq!(Signal::from_str("Kill").unwrap(), Signal::ForceStop);
+assert_eq!(Signal::from_str("15").unwrap(), Signal::Terminate);
+```
+
+`from_unix_str` and `from_windows_str` are available separately if you need to restrict which syntax is accepted.
+
+## Display
+
+`Signal` implements `Display`. On Unix the output is the standard POSIX name; on Windows it uses the equivalent control event name:
+
+| Variant | Unix display | Windows display |
+|---|---|---|
+| `Hangup` | `SIGHUP` | `CTRL-CLOSE` |
+| `ForceStop` | `SIGKILL` | `STOP` |
+| `Interrupt` | `SIGINT` | `CTRL-C` |
+| `Quit` | `SIGQUIT` | `SIGQUIT` |
+| `Terminate` | `SIGTERM` | `CTRL-BREAK` |
+| `User1` | `SIGUSR1` | `SIGUSR1` |
+| `User2` | `SIGUSR2` | `SIGUSR2` |
+| `Custom(n)` | `n` | `n` |
+
+## JSON serialization
+
+With the `serde` feature, named variants serialize as their POSIX string names and `Custom(n)` serializes as a raw integer. This matches the format emitted by `--emit-events-to=json-stdio`.
+
+```json
+"SIGHUP"   // Hangup
+"SIGINT"   // Interrupt
+"SIGTERM"  // Terminate
+9          // Custom(9) or ForceStop as a number
+```
+
+## Common patterns in action handlers
+
+### Quit on Interrupt
+
+```rust
+use watchexec_signals::Signal;
+use std::time::Duration;
+
+wx.config.on_action(|mut action| {
+    if action.signals().any(|sig| sig == Signal::Interrupt) {
+        action.quit_gracefully(Signal::ForceStop, Duration::ZERO);
+    }
+    action
+});
+```
+
+### Reload configuration on Hangup
+
+```rust
+use watchexec_signals::Signal;
+
+wx.config.on_action(|mut action| {
+    if action.signals().any(|sig| sig == Signal::Hangup) {
+        // reload config, then let running jobs handle it naturally
+        for (_, job) in action.list_jobs() {
+            job.signal(Signal::Hangup);
+        }
+    }
+    action
+});
+```
+
+### Matching multiple signals
+
+```rust
+use watchexec_signals::Signal;
+use std::time::Duration;
+
+wx.config.on_action(|mut action| {
+    for sig in action.signals() {
+        match sig {
+            Signal::Interrupt | Signal::Terminate => {
+                action.quit_gracefully(Signal::ForceStop, Duration::from_secs(5));
+                break;
+            }
+            Signal::User1 => {
+                // dump diagnostics, etc.
+            }
+            Signal::User2 => {
+                // reload config
+            }
+            _ => {}
+        }
+    }
+    action
+});
+```
+
+### Sending a signal to a managed job
+
+`Job::signal` accepts a `Signal` directly:
+
+```rust
+use watchexec_signals::Signal;
+use std::time::Duration;
+
+// Graceful stop: send SIGTERM, wait 5 s, then SIGKILL
+job.stop_with_signal(Signal::Terminate, Duration::from_secs(5)).await;
+
+// Send an arbitrary signal
+job.signal(Signal::User1).await;
+```
+
+<CardGroup cols={2}>
+  <Card title="watchexec-events" icon="tag" href="/library/events">
+    `Signal` appears inside `Tag::Signal` and `ProcessEnd::ExitSignal`.
+  </Card>
+  <Card title="watchexec-supervisor" icon="circle-play" href="/library/supervisor">
+    `Job::signal()` and `Job::stop_with_signal()` accept `Signal` values.
+  </Card>
+</CardGroup>

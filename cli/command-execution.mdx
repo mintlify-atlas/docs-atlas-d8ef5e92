@@ -1,0 +1,345 @@
+---
+title: "Command execution and process control in watchexec"
+description: "Reference for watchexec command execution flags: shell selection, process wrapping, busy-update modes, signals, timeout, socket passing, and working directory."
+---
+
+When a filtered event passes through the pipeline, watchexec runs the command you provided. By default the command runs once immediately at startup and again after each qualifying event. This page covers how the command is invoked, how the child process is managed, and the many ways you can adjust that behaviour—from choosing a shell to setting environment variables, controlling what happens when the command is already running, and adding socket-passing support.
+
+## The command argument
+
+<ParamField path="[COMMAND]" type="string">
+  The program and arguments to run when changes are detected. Separate watchexec flags from the command with `--` to avoid ambiguity.
+
+  At startup, the command is run once unless `--postpone` is given. After that it is re-run whenever an event passes all filters and the debounce period elapses.
+
+  Behaviour depends on `--shell`:
+  - For any shell (the default), all parts of the command are joined with spaces and passed to the shell via its `-c` flag.
+  - For `--shell=none`, the first token is the executable and the rest are arguments, passed directly via `execvp(3)`. No shell expansion occurs.
+
+  <Warning>
+    Your shell may expand globs or environment variables before passing them to watchexec. Quote patterns carefully or use `--shell=none` to bypass your shell entirely.
+  </Warning>
+
+  ```bash
+  # Basic usage
+  watchexec make
+
+  # Separate watchexec flags from command flags with --
+  watchexec -w src -- rsync -a src/ dest/
+
+  # Shell expansion happens in your shell before watchexec sees the argument
+  watchexec echo 'src/*.rs'
+
+  # Bypass expansion with --shell=none
+  watchexec --shell=none echo 'src/*.rs'
+  ```
+</ParamField>
+
+## Shell selection
+
+<ParamField path="--shell" type="SHELL">
+  Choose the shell used to run the command.
+
+  **Default on Unix:** the value of `$SHELL`, falling back to `sh`.
+  **Default on Windows:** whichever of `pwsh`, `powershell`, or `cmd` (CMD.EXE) watchexec detects as the running shell.
+
+  The command is invoked as `shell -c "command"` (or `/C` on cmd). If the shell value contains spaces it is parsed as a command line: the first word is the shell binary and the rest are flags passed before `-c`.
+
+  The special value `none` disables shell use entirely—see `-n` below.
+
+  <Tabs>
+    <Tab title="Unix shells">
+      ```bash
+      # Use bash explicitly
+      watchexec --shell=bash -- 'echo $BASH_VERSION'
+
+      # Use zsh with options
+      watchexec --shell='zsh -x -o shwordsplit' -- scr
+      ```
+    </Tab>
+    <Tab title="Windows shells">
+      ```bash
+      # Use PowerShell Core
+      watchexec --shell=pwsh -- Test-Connection localhost
+
+      # Use CMD.exe
+      watchexec --shell=cmd -- dir
+      ```
+    </Tab>
+  </Tabs>
+</ParamField>
+
+<ParamField path="-n" type="boolean">
+  Shorthand for `--shell=none`. The command is executed directly without a shell.
+
+  Direct execution is slightly more efficient and gives you precise control over arguments, but shell features (globbing, redirection, pipes, aliases) are unavailable.
+
+  ```bash
+  # Run zsh directly with custom flags
+  watchexec -n -- zsh -x -o shwordsplit scr
+  ```
+</ParamField>
+
+## Busy-update behaviour
+
+These flags control what watchexec does when a new event arrives while the command is still running.
+
+<ParamField path="-o / --on-busy-update" type="MODE" default="do-nothing">
+  Set the policy for handling events received while the command is running.
+
+  | Mode | Behaviour |
+  |---|---|
+  | `do-nothing` | Ignore events while the command runs. Changes caused by the command (e.g. compilation output) are silently dropped. **Default.** |
+  | `queue` | Wait for the command to finish, then run it once more if any events occurred during its run. |
+  | `restart` | Send a stop signal to the running command and start a fresh run. |
+  | `signal` | Send a signal to the running command without stopping or restarting it. Configure the signal with `--signal`. |
+
+  ```bash
+  # Queue runs so no events are lost
+  watchexec -o queue make
+
+  # Restart on every change
+  watchexec -o restart node app.js
+
+  # Send SIGHUP to reload config instead of restarting
+  watchexec -o signal -s SIGHUP nginx
+  ```
+</ParamField>
+
+<ParamField path="-r / --restart" type="boolean">
+  Shorthand for `--on-busy-update=restart`. Terminates the running command and starts a new one whenever an event arrives while it is running.
+
+  ```bash
+  watchexec -r node app.js
+  ```
+</ParamField>
+
+## Signals
+
+<ParamField path="-s / --signal" type="SIGNAL">
+  Send a signal to the running process when a new event arrives. Implies `--on-busy-update=signal`.
+
+  Signal syntax is case-insensitive and accepts full names (`SIGTERM`), short names (`TERM`), or numbers (`15`).
+
+  <Note>
+    Signals are not supported on Windows. They are silently overridden to a termination event. See `--stop-signal` for details on Windows signal mapping.
+  </Note>
+
+  ```bash
+  # Send SIGHUP to nginx on file change (reload config)
+  watchexec -s SIGHUP nginx
+
+  # Send SIGUSR1
+  watchexec -s USR1 myapp
+  ```
+</ParamField>
+
+<ParamField path="--stop-signal" type="SIGNAL" default="SIGTERM">
+  The signal sent to stop the command in `restart` and `signal` modes.
+
+  **Default on Unix:** `SIGTERM`.
+
+  After sending this signal, watchexec waits up to `--stop-timeout` for the process to exit, then force-kills it.
+
+  On Windows, only the `KILL`/`STOP` termination event is supported. Unix signal names are mapped: `SIGKILL` → terminate, `SIGINT` → Ctrl+C, `SIGTERM` → Ctrl+Close, `SIGHUP` → Ctrl+Break.
+
+  ```bash
+  # Use SIGINT instead of SIGTERM to stop
+  watchexec -r --stop-signal SIGINT node app.js
+
+  # Immediately force-kill on restart (SIGKILL)
+  watchexec -r --stop-signal SIGKILL make
+  ```
+</ParamField>
+
+<ParamField path="--stop-timeout" type="TIMEOUT" default="10s">
+  How long to wait for the command to exit after the stop signal before force-killing it.
+
+  **Default:** `10s`. Set to `0` to force-kill immediately.
+
+  Accepts a human-readable duration such as `"5s"`, `"1min 30s"`. Has no effect on Windows, where processes are always force-terminated.
+
+  ```bash
+  # Allow 30 seconds for graceful shutdown
+  watchexec -r --stop-timeout 30s node server.js
+
+  # Force-kill immediately on restart
+  watchexec -r --stop-timeout 0 make
+  ```
+</ParamField>
+
+<ParamField path="--map-signal" type="SIGNAL:SIGNAL">
+  Translate a signal received by watchexec into a different signal before forwarding it to the command. Provide a colon-separated pair: `FROM:TO`. Omit `TO` to discard the signal.
+
+  If SIGINT or SIGTERM are mapped, they no longer cause watchexec itself to quit.
+
+  Can be specified multiple times to map multiple signals.
+
+  ```bash
+  # Forward Ctrl-C to the command without quitting watchexec
+  watchexec --map-signal INT:INT node app.js
+
+  # Translate SIGTERM into SIGINT for the command
+  watchexec --map-signal TERM:INT node app.js
+
+  # Discard SIGTERM (watchexec won't stop on it)
+  watchexec --map-signal TERM: myapp
+  ```
+</ParamField>
+
+## Timeout
+
+<ParamField path="--timeout" type="TIMEOUT">
+  Kill the command if it runs longer than the specified duration.
+
+  After the timeout is reached, watchexec sends `--stop-signal` and waits up to `--stop-timeout` before force-killing. Each run of the command has its own independent timeout.
+
+  Accepts durations such as `"30s"`, `"5min"`, `"1h 30m"`.
+
+  ```bash
+  # Kill if running longer than 2 minutes
+  watchexec --timeout 2min make test
+
+  # Short timeout for a fast feedback loop
+  watchexec --timeout 10s npm test
+  ```
+</ParamField>
+
+## Process wrapping
+
+<ParamField path="--wrap-process" type="MODE" default="session on macOS, group elsewhere">
+  Control how watchexec wraps the child process for signal and termination delivery.
+
+  | Mode | Behaviour |
+  |---|---|
+  | `group` | Run in a process group (Unix) or Job Object (Windows). Default on Linux and Windows. |
+  | `session` | Run in a process session (Unix) or Job Object (Windows). Default on macOS. |
+  | `none` | Run the command directly without any grouping. |
+
+  Using a group or session ensures that signals and termination are delivered to the entire process tree spawned by the command, not just the immediate child.
+
+  ```bash
+  # Prefer session wrapping (useful for some Unix programs)
+  watchexec --wrap-process=session make
+
+  # Disable wrapping entirely
+  watchexec --wrap-process=none myapp
+  ```
+</ParamField>
+
+<ParamField path="--no-process-group" type="boolean" deprecated>
+  Deprecated. Use `--wrap-process=none` instead.
+</ParamField>
+
+## Startup and timing
+
+<ParamField path="-p / --postpone" type="boolean">
+  Do not run the command at startup; wait for the first event before running.
+
+  Useful when the command should only run in response to a real change, not speculatively on startup.
+
+  ```bash
+  watchexec -p make test
+  ```
+</ParamField>
+
+<ParamField path="--delay-run" type="DURATION">
+  Sleep for the specified duration after an event before running the command. Equivalent to prefixing the command with `sleep N &&`, but portable.
+
+  Accepts a human-readable duration such as `"2s"`, `"500ms"`, `"1min 5s"`.
+
+  ```bash
+  # Wait 2 seconds after a change before building
+  watchexec --delay-run 2s make
+  ```
+</ParamField>
+
+## Working directory and environment
+
+<ParamField path="--workdir" type="DIRECTORY">
+  Set the working directory for the command. Defaults to watchexec's own working directory.
+
+  ```bash
+  watchexec --workdir /var/www make
+  ```
+</ParamField>
+
+<ParamField path="-E / --env" type="KEY=VALUE">
+  Set an environment variable for the command only, without affecting watchexec's own environment. Can be repeated for multiple variables.
+
+  ```bash
+  watchexec -E NODE_ENV=development -E PORT=3000 node app.js
+  ```
+</ParamField>
+
+## Socket passing
+
+<ParamField path="--socket" type="PORT">
+  Open a socket and pass it to the command using the systemd socket-activation protocol, compatible with [`systemfd`](https://github.com/mitsuhiko/systemfd).
+
+  This lets you keep a TCP socket open across command restarts, avoiding port reuse delays and dropped packets.
+
+  The value can be:
+  - `PORT` — TCP socket at the given port
+  - `HOST:PORT` — TCP socket bound to a specific host (IPv6 addresses in `[brackets]`)
+  - `TYPE::PORT` or `TYPE::HOST:PORT` — explicit socket type (`tcp` or `udp`)
+
+  Can be repeated to open multiple sockets.
+
+  <Warning>
+    Watchexec does not set `LISTEN_PID` on Unix. Any child of your command could accidentally bind to the passed sockets unless you explicitly remove the `LISTEN_*` environment variables from their environment.
+  </Warning>
+
+  ```bash
+  # Pass a TCP socket on port 8080
+  watchexec --socket 8080 -r node app.js
+
+  # Pass a UDP socket
+  watchexec --socket udp::9000 -r ./my-server
+
+  # Pass multiple sockets
+  watchexec --socket 8080 --socket 8443 -r node app.js
+  ```
+</ParamField>
+
+## Interactive mode
+
+<ParamField path="-I / --interactive" type="boolean">
+  Enable keypress controls in the terminal.
+
+  When active, watchexec listens for keypresses and responds:
+
+  | Key | Action |
+  |---|---|
+  | `r` | Restart the command immediately |
+  | `p` | Toggle pausing the watch |
+  | `q` | Quit watchexec |
+
+  Requires a terminal (TTY). Puts stdin into raw mode, so the child process cannot read stdin input. Incompatible with `--watch-file=-`.
+
+  ```bash
+  watchexec -I -r node app.js
+  ```
+</ParamField>
+
+## Exit conditions
+
+<ParamField path="--exit-on-error" type="boolean">
+  Exit watchexec when the command finishes with a non-zero exit status.
+
+  By default, watchexec continues watching and re-running regardless of exit status. This flag makes watchexec exit immediately on command failure, which is useful in process managers or containers where a failed command should trigger a container restart rather than an indefinite wait.
+
+  ```bash
+  watchexec --exit-on-error make test
+  ```
+</ParamField>
+
+<ParamField path="--stdin-quit" type="boolean">
+  Exit watchexec gracefully when stdin reaches EOF.
+
+  Some process managers signal child processes by closing their stdin. This flag makes watchexec honour that convention. Incompatible with `--watch-file=-`.
+
+  ```bash
+  watchexec --stdin-quit make
+  ```
+</ParamField>

@@ -1,0 +1,174 @@
+---
+title: "Passing file change events to child processes"
+description: "How watchexec can emit changed file paths and event data to child processes via environment variables, stdin, or JSON, with mode details."
+---
+
+By default, watchexec runs your command without telling it which files changed. In many workflows, however, the command needs to know what changed — to target a specific test file, sync only the modified asset, or build a diff-aware pipeline. Watchexec supports several event emission modes, ranging from simple path lists to structured JSON streams.
+
+Configure the mode with `--emit-events-to <MODE>`.
+
+<Tabs>
+  <Tab title="none">
+    **Default.** No event information is passed to the child process. The command runs as if invoked manually.
+
+    ```bash
+    watchexec make
+    ```
+  </Tab>
+
+  <Tab title="environment">
+    <Warning>
+      The `environment` mode is deprecated and will be removed in a future version. Use `stdio`, `file`, `json-stdio`, or `json-file` instead.
+    </Warning>
+
+    Sets environment variables in the child process with paths of affected files:
+
+    | Variable | Event kind |
+    |---|---|
+    | `$WATCHEXEC_COMMON_PATH` | Longest common path prefix of all changed paths |
+    | `$WATCHEXEC_CREATED_PATH` | Files/folders created |
+    | `$WATCHEXEC_REMOVED_PATH` | Files/folders removed |
+    | `$WATCHEXEC_RENAMED_PATH` | Files/folders renamed |
+    | `$WATCHEXEC_WRITTEN_PATH` | Files/folders modified |
+    | `$WATCHEXEC_META_CHANGED_PATH` | Files/folders with metadata changes |
+    | `$WATCHEXEC_OTHERWISE_CHANGED_PATH` | All other events |
+
+    `$WATCHEXEC_COMMON_PATH` must be prepended to each path in the other variables to get a full path. Paths within each variable are separated by `:` on Unix and `;` on Windows, and are deduplicated and sorted in binary order.
+
+    ```bash
+    watchexec --emit-events-to=environment make
+    ```
+
+    **Limitations:** The environment has a hard size limit. A large number of changed files can truncate the variables, cause an error, or crash the child process. This mode also cannot represent the full set of watchexec event types.
+  </Tab>
+
+  <Tab title="stdio">
+    Writes absolute paths to the **stdin** of the child process, one per line, each prefixed with the event kind. Stdin is closed when all events have been written.
+
+    Prefixes:
+
+    | Prefix | Meaning |
+    |---|---|
+    | `create:` | File or folder created |
+    | `remove:` | File or folder removed |
+    | `rename:` | File or folder renamed |
+    | `modify:` | File or folder modified |
+    | `other:` | Any other event |
+
+    ```bash
+    watchexec --emit-events-to=stdio -- my-script.sh
+    ```
+
+    Example script reading from stdin:
+
+    ```bash
+    #!/usr/bin/env bash
+    while IFS= read -r line; do
+      echo "Event: $line"
+    done
+    ```
+  </Tab>
+
+  <Tab title="file">
+    Same format as `stdio`, but written to a temporary file. The path to the file is provided in the `$WATCHEXEC_EVENTS_FILE` environment variable.
+
+    ```bash
+    watchexec --emit-events-to=file -- bash -c 'cat "$WATCHEXEC_EVENTS_FILE"'
+    ```
+
+    Use `file` instead of `stdio` when your command needs to read events at its own pace or when stdin is already in use.
+  </Tab>
+
+  <Tab title="json-stdio">
+    Writes one JSON object per line to the **stdin** of the child process, then closes stdin. Each object represents one event and can encode the full range of watchexec event types.
+
+    ```bash
+    watchexec --emit-events-to=json-stdio -- python process_events.py
+    ```
+
+    Example output for a file modification on Linux:
+
+    ```json
+    {
+      "tags": [
+        {"kind": "path", "absolute": "/home/user/file.rs", "filetype": "file"},
+        {"kind": "fs", "simple": "modify", "full": "Modify(Data(Any))"},
+        {"kind": "source", "source": "filesystem"}
+      ],
+      "metadata": {"notify-backend": "inotify"}
+    }
+    ```
+
+    Example for a folder being created:
+
+    ```json
+    {
+      "tags": [
+        {"kind": "path", "absolute": "/home/user/your/new-folder", "filetype": "dir"},
+        {"kind": "fs", "simple": "create", "full": "Create(Folder)"},
+        {"kind": "source", "source": "filesystem"}
+      ],
+      "metadata": {"notify-backend": "inotify"}
+    }
+    ```
+
+    Process events in Python:
+
+    ```python
+    import sys, json
+
+    for line in sys.stdin:
+        event = json.loads(line)
+        for tag in event["tags"]:
+            if tag["kind"] == "path":
+                print(f"Changed: {tag['absolute']}")
+    ```
+  </Tab>
+
+  <Tab title="json-file">
+    Same as `json-stdio` but written to a temporary file. The path is available in `$WATCHEXEC_EVENTS_FILE`.
+
+    ```bash
+    watchexec --emit-events-to=json-file -- bash -c 'jq . "$WATCHEXEC_EVENTS_FILE"'
+    ```
+  </Tab>
+</Tabs>
+
+## JSON tag schema
+
+Each event object contains a `tags` array and a `metadata` object. The `kind` field of each tag determines which additional fields are present:
+
+| `kind` | Additional fields | Description |
+|---|---|---|
+| `path` | `absolute` (string), `filetype` (`file`, `dir`, `symlink`, `other`) | A filesystem path that was affected |
+| `fs` | `simple` (`access`, `create`, `modify`, `remove`, `other`), `full` (string) | The filesystem event type |
+| `source` | `source` (`filesystem`, `keyboard`, `mouse`, `os`, `time`, `internal`) | Origin of the event |
+| `keyboard` | `keycode` (currently only `eof`) | A keyboard event |
+| `process` | `pid` (integer) | Event caused by a process |
+| `signal` | `signal` (`hangup`, `interrupt`, `quit`, `terminate`, `user1`, `user2`) | Signal sent to watchexec |
+| `completion` | `disposition` (`success`, `error`, `signal`, `stop`, `exception`, `continued`), `code` (integer) | A command completed |
+
+The `metadata` object contains additional backend-specific information, such as `notify-backend` on Linux.
+
+## Using watchexec as a pure event stream
+
+Pass `--only-emit-events` to run watchexec without executing any command — it becomes a file watcher that streams events and nothing else.
+
+```bash
+watchexec --only-emit-events --emit-events-to=json-stdio
+```
+
+This implies `--emit-events-to=json-stdio`. To use text mode instead:
+
+```bash
+watchexec --only-emit-events --emit-events-to=stdio
+```
+
+<Tip>
+  Pipe the JSON stream into `jq` to filter for specific event types:
+
+  ```bash
+  watchexec --only-emit-events --emit-events-to=json-stdio | \
+    jq 'select(.tags[] | select(.kind == "fs" and .simple == "create"))'
+  ```
+</Tip>

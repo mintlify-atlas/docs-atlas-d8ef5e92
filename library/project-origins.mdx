@@ -1,0 +1,176 @@
+---
+title: "project-origins: detect project root and type"
+description: "The project-origins crate finds the root directory of a project and identifies what kind of project it is — Git, Cargo, Node, etc."
+---
+
+The `project-origins` crate answers two questions about a path: where is the project root, and what kind of project is it? Starting from a given directory, it walks upward through parent directories and identifies any that look like project origins — based on the presence of well-known files and directories like `.git`, `Cargo.toml`, `package.json`, and many others. It returns the full set of detected origins rather than stopping at the first match, which handles cases like Cargo workspace members (which have two valid origins: the member directory and the workspace root).
+
+## Adding to your project
+
+```toml
+[dependencies]
+project-origins = "1"
+tokio = { version = "1", features = ["full"] }
+```
+
+## Finding project origins
+
+### `origins`
+
+`origins` takes any path and returns a `HashSet<PathBuf>` of all directories, from that path up to the filesystem root, that appear to be project roots.
+
+```rust
+use project_origins::origins;
+use std::path::Path;
+
+#[tokio::main]
+async fn main() {
+    let found = origins(Path::new("/home/user/my-workspace/member-crate/src")).await;
+
+    for origin in &found {
+        println!("origin: {}", origin.display());
+    }
+    // might print:
+    //   origin: /home/user/my-workspace/member-crate
+    //   origin: /home/user/my-workspace
+}
+```
+
+`origins` checks for a broad set of indicator files and directories, including:
+
+- VCS directories: `.git`, `.hg`, `.bzr`, `_darcs`, `.fossil-settings`, `.svn`, `.github`
+- VCS files: `.gitattributes`, `.gitmodules`, `.bzrignore`, `.hgignore`, `.hgtags`
+- Build/package files: `Cargo.toml`, `Cargo.lock`, `package.json`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `go.mod`, `go.sum`, `pom.xml`, `build.gradle`, `Makefile`, `CMakeLists.txt`, `Dockerfile`, `docker-compose.yml`, `requirements.txt`, `Pipfile`, `Gemfile`, `composer.json`, `mix.exs`, `project.clj`, `build.zig`, `v.mod`, and more
+- Common convention files: `LICENSE`, `COPYING`, `CONTRIBUTING.md`, `.editorconfig`, `.travis.yml`, `appveyor.yml`, `.codecov.yml`
+
+<Note>
+Because `origins` returns a `HashSet`, the results are unordered. If you need to pick a single "most specific" origin, sort by path depth and take the deepest one.
+</Note>
+
+### `types`
+
+Given a known origin directory, `types` returns the set of `ProjectType` variants detected at that directory. Use it with each path from `origins` to understand what kind of project each root represents.
+
+```rust
+use project_origins::{origins, types};
+use std::path::Path;
+
+#[tokio::main]
+async fn main() {
+    let path = Path::new("/home/user/my-project");
+    let roots = origins(path).await;
+
+    for root in &roots {
+        let project_types = types(root).await;
+        println!("{}: {project_types:?}", root.display());
+    }
+}
+```
+
+## The `ProjectType` enum
+
+`ProjectType` is `#[non_exhaustive]` and covers two categories: VCS systems and software build environments.
+
+### VCS types
+
+| Variant | Detection |
+|---|---|
+| `Git` | `.git` dir or file, `.gitattributes`, `.gitmodules` |
+| `Mercurial` | `.hg` dir, `.hgignore`, `.hgtags` |
+| `Bazaar` | `.bzr` dir, `.bzrignore` |
+| `Darcs` | `_darcs` dir |
+| `Fossil` | `.fossil-settings` dir |
+| `Subversion` | `.svn` dir |
+| `Pijul` | not currently detected |
+
+### Software suite types
+
+| Variant | Detection |
+|---|---|
+| `Cargo` | `Cargo.toml` |
+| `JavaScript` | `package.json`, `cgmanifest.json` |
+| `Go` | `go.mod`, `go.sum` |
+| `Pip` | `requirements.txt`, `Pipfile` |
+| `Bundler` | `Gemfile` |
+| `Maven` | `pom.xml` |
+| `Gradle` | `build.gradle` |
+| `Docker` | `Dockerfile` |
+| `Elixir` | `mix.exs` |
+| `Leiningen` | `project.clj` |
+| `Perl` | `.perltidyrc`, `Makefile.PL` |
+| `PHP` | `composer.json` |
+| `C` | `.ctags` |
+| `V` | `v.mod` |
+| `Zig` | `build.zig` |
+
+`ProjectType` provides two classification methods:
+
+```rust
+project_type.is_vcs()   // true for Git, Mercurial, Bazaar, Darcs, Fossil, Pijul, Subversion
+project_type.is_soft()  // true for Cargo, JavaScript, Go, Pip, etc.
+```
+
+## How the search works
+
+Both `origins` and `types` read directory entries once per directory using `tokio::fs::read_dir`. There is no upward traversal in `types` — it only inspects the single directory it is given. `origins` does the traversal, checking each ancestor in turn and collecting those that look like origins.
+
+```text
+/home/user/workspace/my-crate/src/lib.rs
+         │
+         ▼  origins() walks upward from each component:
+/home/user/workspace/my-crate/   ← Cargo.toml found  ✓
+/home/user/workspace/            ← Cargo.toml found  ✓ (workspace)
+/home/user/                      ← nothing found
+/home/                           ← nothing found
+/                                ← nothing found
+
+result: { /home/user/workspace/my-crate, /home/user/workspace }
+```
+
+## Practical use: scoping ignore files
+
+`project-origins` is used by the `ignore-files` crate to determine the scope of ignore files. When building a filterer, you typically want to pass the most specific origin as the `origin` argument to `from_origin`, so that `.gitignore` patterns in nested directories are correctly scoped.
+
+```rust
+use project_origins::origins;
+use ignore_files::from_origin;
+use std::path::Path;
+
+#[tokio::main]
+async fn main() -> miette::Result<()> {
+    let watched = Path::new("/home/user/my-project");
+
+    // Find all project roots from the watched path upward
+    let roots = origins(watched).await;
+
+    // Pick the deepest root as the main origin
+    let mut sorted: Vec<_> = roots.into_iter().collect();
+    sorted.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    let origin = sorted.into_iter().next().unwrap_or_else(|| watched.to_owned());
+
+    let (ignore_files, errors) = from_origin(&origin).await;
+    for err in errors {
+        eprintln!("warning: {err}");
+    }
+
+    println!("using origin: {}", origin.display());
+    println!("found {} ignore files", ignore_files.len());
+
+    Ok(())
+}
+```
+
+## Use case: `--project-origin` override
+
+When watchexec cannot detect the project origin automatically (for example, when watching a directory that does not contain any recognizable project files), users can pass `--project-origin` to specify it explicitly. Internally, watchexec passes this directory to `from_origin` and uses it as the base for `IgnoreFilter`.
+
+If you are building a watchexec-powered tool and want to support the same override, you can skip calling `origins` entirely and pass the user-supplied path directly to `from_origin`.
+
+<CardGroup cols={2}>
+  <Card title="ignore-files" icon="file-x" href="/library/ignore-files">
+    Uses `ProjectType` to scope which ignore files apply to which VCS.
+  </Card>
+  <Card title="watchexec library" icon="book" href="/library/overview">
+    Watchexec uses project-origins to determine the default project root for watching.
+  </Card>
+</CardGroup>

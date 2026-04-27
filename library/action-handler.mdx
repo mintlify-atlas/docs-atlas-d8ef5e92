@@ -1,0 +1,353 @@
+---
+title: "Handling events with the watchexec action handler"
+description: "The action handler closure receives batched events, creates and manages jobs, sends signals, and controls watchexec's lifecycle via ActionHandler."
+---
+
+The action handler is the heart of a watchexec program. It is a closure you provide — either synchronously via `Config::on_action` or asynchronously via `Config::on_action_async` — that runs every time a batch of events passes through the throttle and filterer. Inside it you inspect what changed, decide what processes to start or stop, and optionally signal watchexec to quit.
+
+The handler is called with an `ActionHandler` value (which the library internally calls `Handler`). You mutate it to express your intent, then return it. Watchexec reads the returned value and applies the effects — job creation, quit — after the handler returns.
+
+## `ActionHandler`
+
+```rust
+// pub type ActionHandler = action::Handler
+#[derive(Debug)]
+pub struct Handler {
+    /// The collected events that triggered this action.
+    pub events: Arc<[Event]>,
+    // internal fields for new jobs and quit state
+}
+```
+
+`ActionHandler` (exported as `watchexec::action::ActionHandler`) is the environment passed to — and returned from — your action handler. It carries the current batch of events and gives you methods to inspect them, manage supervised jobs, and request shutdown.
+
+## Inspecting events
+
+### `action.events`
+
+```rust
+pub events: Arc<[Event]>
+```
+
+The slice of all events that were batched together to trigger this action call. Events may be filesystem changes, signals, keyboard input, or synthetic events injected via `send_event`.
+
+```rust
+for event in action.events.iter() {
+    eprintln!("event: {event:?}");
+}
+```
+
+### `action.signals()`
+
+```rust
+pub fn signals(&self) -> impl Iterator<Item = Signal> + '_
+```
+
+Convenience iterator that yields every `Signal` tag across all events in the batch. Use this to detect Ctrl-C (`Signal::Interrupt`), `SIGTERM`, or any other signal.
+
+```rust
+if action.signals().any(|sig| sig == Signal::Interrupt) {
+    action.quit();
+}
+```
+
+### `action.paths()`
+
+```rust
+pub fn paths(&self) -> impl Iterator<Item = (&Path, Option<&FileType>)> + '_
+```
+
+Convenience iterator that yields `(path, file_type)` pairs for every path tag across all events. Use this to detect which files changed and optionally what kind of file they are (`FileType::File`, `FileType::Dir`, `FileType::Symlink`, etc.).
+
+```rust
+for (path, file_type) in action.paths() {
+    eprintln!("changed: {path:?} ({file_type:?})");
+}
+```
+
+### `action.completions()`
+
+```rust
+pub fn completions(&self) -> impl Iterator<Item = Option<ProcessEnd>> + '_
+```
+
+Convenience iterator over `ProcessEnd` tags — process exit notifications — across all events. Useful when responding to a supervised job finishing.
+
+## Job management
+
+Watchexec maintains an internal set of supervised [`Job`](https://docs.rs/watchexec-supervisor) handles. Each job is identified by an `Id` (a cheap, `Copy`-able UUID-like value).
+
+<Note>
+Jobs created with `create_job` are not registered in the Watchexec supervisor set until the action handler returns. Similarly, the quit initiated by `quit()` does not take effect until after the handler returns.
+</Note>
+
+### `action.create_job(command)`
+
+```rust
+pub fn create_job(&mut self, command: Arc<Command>) -> (Id, Job)
+```
+
+Create a new supervised job and return its `(Id, Job)` handle pair. The job is started immediately (the subprocess is spawned), but its `Id` is not visible to future handler calls until this handler returns.
+
+```rust
+use std::sync::Arc;
+use watchexec::command::{Command, Program, Shell};
+
+let (id, job) = action.create_job(Arc::new(Command {
+    program: Program::Shell {
+        shell: Shell::new("bash"),
+        command: "echo hello".into(),
+        args: Vec::new(),
+    },
+    options: Default::default(),
+}));
+
+job.start();
+```
+
+### `action.get_or_create_job(id, command_fn)`
+
+```rust
+pub fn get_or_create_job(
+    &mut self,
+    id: Id,
+    command: impl Fn() -> Arc<Command>,
+) -> Job
+```
+
+Retrieve the job with the given `Id`, or create one if it does not exist. Useful for maintaining a single long-running job across multiple handler invocations by storing its `Id` outside the closure.
+
+### `action.get_job(id)`
+
+```rust
+pub fn get_job(&self, id: Id) -> Option<Job>
+```
+
+Look up an existing supervised job by `Id`. Returns `None` if no job with that `Id` exists (as of when this handler was called).
+
+### `action.list_jobs()`
+
+```rust
+pub fn list_jobs(&self) -> impl Iterator<Item = (Id, Job)> + '_
+```
+
+Iterate over all currently supervised jobs. Order is unspecified. The snapshot is taken when the handler is called, so jobs created in this same invocation do not appear here.
+
+```rust
+for (id, job) in action.list_jobs() {
+    eprintln!("job {id:?} is running: {}", !job.is_dead());
+}
+```
+
+## Job handles
+
+`Job` is a handle from the `watchexec-supervisor` crate. The most important methods are:
+
+| Method | Description |
+|---|---|
+| `job.start()` | Start (or restart) the supervised process |
+| `job.stop()` | Send a graceful stop to the job |
+| `job.stop_with_signal(signal, grace)` | Send `signal`, then force-kill after `grace` |
+| `job.run(closure)` | Inspect job state via `CommandState` |
+| `job.to_wait()` | Async — resolves when the current run finishes |
+| `job.is_dead()` | Returns `true` if the job has been dropped/reaped |
+| `job.delete()` | Async — reap the job after it stops |
+
+### `CommandState`
+
+The closure passed to `job.run()` receives a context whose `current` field is a `CommandState`:
+
+```rust
+// from watchexec_supervisor::job
+pub enum CommandState {
+    Pending,
+    Running { pid: u32, started: Instant },
+    Finished { status: ProcessEnd, started: Instant, finished: Instant },
+}
+```
+
+```rust
+job.run(|context| {
+    if let CommandState::Finished { status, started, finished } = context.current {
+        let duration = *finished - *started;
+        eprintln!("exited with {status:?} after {duration:?}");
+    }
+}).await;
+```
+
+## Quitting
+
+### `action.quit()`
+
+```rust
+pub fn quit(&mut self)
+```
+
+Request an immediate shutdown. Kills all supervised processes and drops all jobs without waiting for them to finish. Watchexec exits after the handler returns.
+
+### `action.quit_gracefully(signal, grace)`
+
+```rust
+pub fn quit_gracefully(&mut self, signal: Signal, grace: Duration)
+```
+
+Request a graceful shutdown. Sends `signal` to all running jobs, waits up to `grace` for them to finish, then force-kills any that are still alive, then exits.
+
+```rust
+use std::time::Duration;
+use watchexec_signals::Signal;
+
+// give jobs 5 seconds to clean up
+action.quit_gracefully(Signal::Terminate, Duration::from_secs(5));
+
+// immediate graceful quit (still waits for jobs to be reaped)
+action.quit_gracefully(Signal::ForceStop, Duration::ZERO);
+```
+
+## ActionReturn
+
+```rust
+pub enum ActionReturn {
+    /// Returned by synchronous handlers (Config::on_action).
+    Sync(ActionHandler),
+
+    /// Returned by async handlers (Config::on_action_async).
+    Async(Box<dyn Future<Output = ActionHandler> + Send + Sync>),
+}
+```
+
+`ActionReturn` is the raw return type of the `action_handler` field on `Config`. You do not normally interact with it — `Config::on_action` and `Config::on_action_async` wrap your closure automatically.
+
+## Important: keep the handler fast
+
+The action handler runs in the event loop. While it is running, no new events are processed and the event channel accumulates backpressure. If it fills completely (default 4096 events), incoming events are dropped.
+
+<Warning>
+Never block inside the action handler. Use `tokio::spawn` to offload long-running work, communicate results back via channels or a `Mutex`.
+</Warning>
+
+## Changing config from inside the handler
+
+You can call `wx.config.on_action(...)` or any other `Config` method from inside the handler — for example, to change the watched paths after a certain event. The new value takes effect immediately (on the next acquisition of the lock), so it may influence the very next action call.
+
+```rust
+// swap the action handler from within itself
+let wx2 = wx.clone();
+wx.config.on_action(move |mut action| {
+    if action.paths().next().is_some() {
+        // switch to a different handler after the first file event
+        wx2.config.on_action(|mut action| {
+            action.quit();
+            action
+        });
+    }
+    action
+});
+```
+
+## Comprehensive example
+
+This example from the library README demonstrates the full pattern: an initial job, auto-restart, responding to file changes, and quitting on Ctrl-C.
+
+```rust
+use miette::{IntoDiagnostic, Result};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use watchexec::{
+    command::{Command, Program, Shell},
+    job::CommandState,
+    Watchexec,
+};
+use watchexec_events::{Event, Priority};
+use watchexec_signals::Signal;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let job = Arc::new(Mutex::new(None));
+
+    let wx = Watchexec::new({
+        let outerjob = job.clone();
+        move |mut action| {
+            let (_, job) = action.create_job(Arc::new(Command {
+                program: Program::Shell {
+                    shell: Shell::new("bash"),
+                    command: "echo 'Hello world'; read".into(),
+                    args: Vec::new(),
+                },
+                options: Default::default(),
+            }));
+
+            *outerjob.lock().unwrap() = Some(job.clone());
+            job.start();
+            action
+        }
+    })?;
+
+    let main = wx.main();
+
+    // trigger the initial action immediately
+    wx.send_event(Event::default(), Priority::Urgent)
+        .await
+        .unwrap();
+
+    // spin until the job is ready
+    while job.lock().unwrap().is_none() {
+        tokio::task::yield_now().await;
+    }
+
+    // auto-restart the job when it exits
+    let job = job.lock().unwrap().clone().unwrap();
+    let auto_restart = tokio::spawn(async move {
+        loop {
+            job.to_wait().await;
+            job.run(|ctx| {
+                if let CommandState::Finished { status, started, finished } = ctx.current {
+                    eprintln!("[stopped with {status:?}; ran for {:?}]", *finished - *started);
+                }
+            }).await;
+            eprintln!("[Restarting...]");
+            job.start().await;
+        }
+    });
+
+    // now replace the action handler to handle file changes and Ctrl-C
+    let abort = auto_restart.abort_handle();
+    wx.config.on_action(move |mut action| {
+        if action.signals().any(|sig| sig == Signal::Interrupt) {
+            eprintln!("[Quitting...]");
+            abort.abort();
+            action.quit_gracefully(Signal::ForceStop, Duration::ZERO);
+            return action;
+        }
+
+        if action.paths().next().is_some() {
+            if let Some((_, job)) = action.list_jobs().next() {
+                eprintln!("[File changed, stopping job...]");
+                job.stop_with_signal(Signal::Terminate, Duration::from_secs(5));
+            }
+        }
+
+        action
+    });
+
+    wx.config.pathset(["."]);
+
+    main.await.into_diagnostic()?;
+    auto_restart.abort();
+    Ok(())
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Watchexec struct" href="/library/watchexec">
+    Constructors and send_event
+  </Card>
+  <Card title="Config reference" href="/library/config">
+    on_action, on_action_async, and all other settings
+  </Card>
+  <Card title="Filterers" href="/library/filterers">
+    Controlling which events reach your handler
+  </Card>
+</CardGroup>

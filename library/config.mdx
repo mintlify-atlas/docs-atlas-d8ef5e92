@@ -1,0 +1,257 @@
+---
+title: "Configuring watchexec at runtime with Config"
+description: "Config controls what watchexec watches, how it throttles events, which filterer to use, and what to do on errors — all changeable at runtime."
+---
+
+`Config` is the live configuration store for a `Watchexec` instance. Almost every field is wrapped in a `Changeable` — a lock-free-read container — so any setting can be replaced from a shared `&self` reference without stopping the engine. The `Config` is exposed as `wx.config` (an `Arc<Config>`) and all the setter methods return `&Self`, making them chainable.
+
+Most changes take effect immediately: watchexec reads configuration just-in-time, immediately before each use. The only exceptions are `error_channel_size` and `event_channel_size`, which must be set before `Watchexec::with_config` is called.
+
+## Action handlers
+
+### `config.on_action(handler)`
+
+```rust
+pub fn on_action(
+    &self,
+    handler: impl (Fn(ActionHandler) -> ActionHandler) + Send + Sync + 'static,
+) -> &Self
+```
+
+Set the synchronous action handler. The handler receives an [`ActionHandler`](/library/action-handler) value, must mutate it to express what to do (quit, create jobs, etc.), and return it. It is called on every batch of events that passes the filterer and throttle.
+
+<Warning>
+The handler blocks the event loop while it runs. Never perform blocking I/O or long computation directly inside it — spawn a Tokio task instead.
+</Warning>
+
+```rust
+wx.config.on_action(|mut action| {
+    if action.signals().any(|sig| sig == Signal::Interrupt) {
+        action.quit();
+    }
+    action
+});
+```
+
+### `config.on_action_async(handler)`
+
+```rust
+pub fn on_action_async(
+    &self,
+    handler: impl (Fn(ActionHandler) -> Box<dyn Future<Output = ActionHandler> + Send + Sync>)
+        + Send + Sync + 'static,
+) -> &Self
+```
+
+Set an async action handler. The closure must return a `Box<dyn Future<Output = ActionHandler> + Send + Sync>`. The future is `await`ed before the next event batch is processed.
+
+```rust
+wx.config.on_action_async(|mut action| {
+    Box::new(async move {
+        if action.signals().any(|sig| sig == Signal::Interrupt) {
+            action.quit();
+        }
+        action
+    })
+});
+```
+
+## Filesystem watching
+
+### `config.pathset(paths)`
+
+```rust
+pub fn pathset<I, P>(&self, pathset: I) -> &Self
+where
+    I: IntoIterator<Item = P>,
+    P: Into<WatchedPath>,
+```
+
+Set the set of filesystem paths to watch. Accepts any iterator of items that convert to `WatchedPath` — plain `&str`, `PathBuf`, and `WatchedPath` all work. Replaces the entire current pathset.
+
+- If the pathset is non-empty, the filesystem event source is started (or reconfigured).
+- If the pathset becomes empty, the filesystem event source shuts down.
+
+```rust
+// watch a single directory
+wx.config.pathset(["."]);
+
+// watch multiple paths
+wx.config.pathset(["/src", "/tests", "/Cargo.toml"]);
+```
+
+### `config.file_watcher(watcher)`
+
+```rust
+pub fn file_watcher(&self, watcher: Watcher) -> &Self
+```
+
+Set the backend filesystem watcher. The `Watcher` enum has two variants:
+
+```rust
+pub enum Watcher {
+    /// Platform-native watcher (inotify, kqueue, FSEvents, etc.)
+    /// This is the default.
+    Native,
+
+    /// notify's poll watcher with a configurable interval.
+    Poll(Duration),
+}
+```
+
+Use `Watcher::Poll` on network filesystems or when native watchers are unavailable:
+
+```rust
+use std::time::Duration;
+use watchexec::sources::fs::Watcher;
+
+wx.config.file_watcher(Watcher::Poll(Duration::from_secs(1)));
+```
+
+### `config.fs_ready()`
+
+```rust
+pub fn fs_ready(&self) -> watch::Receiver<()>
+```
+
+Subscribe to a notification channel that fires each time the filesystem worker finishes applying a pathset change (i.e. OS watches are registered or unregistered). Subscribe **before** calling `pathset()` to avoid missing the notification.
+
+```rust
+let mut ready = wx.config.fs_ready();
+wx.config.pathset(["."]);
+ready.changed().await.unwrap();
+// filesystem watcher is now active
+```
+
+## Event processing
+
+### `config.throttle(duration)`
+
+```rust
+pub fn throttle(&self, throttle: impl Into<Duration>) -> &Self
+```
+
+Set the debounce (trailing-edge throttle) duration. Watchexec waits this long after the first event in a batch before invoking the action handler, accumulating all events that arrive within the window into a single call. Default is **50ms**.
+
+```rust
+use std::time::Duration;
+wx.config.throttle(Duration::from_millis(200));
+```
+
+### `config.keyboard_events(enable)`
+
+```rust
+pub fn keyboard_events(&self, enable: bool) -> &Self
+```
+
+Enable or disable the keyboard/stdin event source. When `true`, watchexec switches stdin to raw (no-line-buffering) mode and emits events for individual keystrokes and EOF. When `false`, the source shuts down and stdin flows normally to child processes again.
+
+<Note>
+Keyboard events require a TTY and are opt-in. Do not enable this if your program is not running interactively.
+</Note>
+
+```rust
+wx.config.keyboard_events(true);
+```
+
+### `config.filterer(filterer)`
+
+```rust
+pub fn filterer(&self, filterer: impl Filterer + 'static) -> &Self
+```
+
+Replace the active filterer with any type that implements the `Filterer` trait. The default filterer is a no-op (`()`) that passes every event. See the [Filterers reference](/library/filterers) for built-in options and how to implement your own.
+
+```rust
+wx.config.filterer(my_globset_filterer);
+```
+
+## Error handling
+
+### `config.on_error(handler)`
+
+```rust
+pub fn on_error(&self, handler: impl Fn(ErrorHook) + Send + Sync + 'static) -> &Self
+```
+
+Set a handler for runtime errors. The default is a no-op. Called for every `RuntimeError` that occurs inside watchexec. Use `ErrorHook::critical` or `ErrorHook::elevate` inside the handler to promote a runtime error to a fatal one.
+
+<Info>
+Do not enable tracing error logging for watchexec unless debugging — it produces a very high volume of output. Use `on_error` instead to selectively surface errors in your application.
+</Info>
+
+```rust
+wx.config.on_error(|err: ErrorHook| {
+    eprintln!("watchexec error: {}", err.error);
+});
+```
+
+To promote filesystem watcher errors to fatal:
+
+```rust
+use watchexec::{ErrorHook, error::RuntimeError};
+
+wx.config.on_error(|err: ErrorHook| {
+    if matches!(err.error, RuntimeError::FsWatcher { .. }) {
+        err.elevate();
+    }
+});
+```
+
+## Signalling config changes
+
+### `config.signal_change()`
+
+```rust
+pub fn signal_change(&self) -> &Self
+```
+
+Manually notify watchexec that configuration has changed. All setter methods call this automatically. Only needed if you write to the public fields directly (e.g. `config.pathset.replace(...)`).
+
+```rust
+config.pathset.replace(vec!["/new/path".into()]);
+config.signal_change();
+```
+
+## Channel size constants
+
+These two fields are public and can be set on a `Config` before passing it to `Watchexec::with_config`. They cannot be changed at runtime.
+
+| Field | Default | Description |
+|---|---|---|
+| `error_channel_size` | `64` | Buffer capacity of the runtime-error channel. Increase if your `on_error` handler is slow or errors arrive in large bursts. |
+| `event_channel_size` | `4096` | Buffer capacity of the event channel. Increase for very high filesystem event throughput. |
+
+```rust
+use watchexec::{Config, Watchexec};
+
+let mut config = Config::default();
+config.error_channel_size = 128;
+config.event_channel_size = 8192;
+
+let wx = Watchexec::with_config(config)?;
+```
+
+## Chaining example
+
+All `Config` methods return `&Self`, so they can be chained:
+
+```rust
+wx.config
+    .pathset(["src", "tests"])
+    .throttle(Duration::from_millis(100))
+    .file_watcher(Watcher::Native)
+    .on_error(|err: ErrorHook| eprintln!("error: {}", err.error));
+```
+
+<CardGroup cols={2}>
+  <Card title="Watchexec struct" href="/library/watchexec">
+    Constructor and lifecycle
+  </Card>
+  <Card title="Action handler" href="/library/action-handler">
+    Handling events inside on_action
+  </Card>
+  <Card title="Filterers" href="/library/filterers">
+    Controlling which events reach your handler
+  </Card>
+</CardGroup>
